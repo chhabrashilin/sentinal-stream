@@ -1,11 +1,19 @@
 # Sentinel-Stream: Lake Mendota Digital Twin
 
+<<<<<<< HEAD
+=======
+Demo recording: https://youtu.be/jjXKpOC2HC8
+
+![Sentinal Stream Demo Screenshot](./sentinal-stream-screenshot.png)
+
+>>>>>>> 61b6a90047afb6e455ed3bddb35f286b46dfed56
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688?logo=fastapi&logoColor=white)
 ![React](https://img.shields.io/badge/React-18.3-61dafb?logo=react&logoColor=black)
 ![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)
 ![Tests](https://img.shields.io/badge/tests-17%20passing-brightgreen)
 
+<<<<<<< HEAD
 A full-stack environmental intelligence pipeline and live dashboard for the **UW-Madison SSEC / NTL-LTER Lake Mendota Buoy** (43.0988°N, 89.4045°W).
 
 Sensor telemetry is ingested at 1 Hz, validated, filtered for outliers, smoothed, persisted, and served through a REST API. A React dashboard visualizes wind, water temperature at 4 depths, a 5-minute ML forecast, thermal stratification status, and real-time lake activity safety assessments.
@@ -69,11 +77,19 @@ docker-compose up --build
 
 Each packet passes through 5 steps:
 
+<<<<<<< HEAD
 1. **Pydantic validation** — rejects physically impossible values (negative wind, coordinates outside Lake Mendota bounding box, etc.)
 2. **Outlier detection** — flags `is_outlier=True` if `wind_speed_ms > 20.0` or `chlorophyll_ugl > 100.0`
 3. **Rolling buffer** — only clean readings enter the 10-point `deque`. Outliers are stored but never corrupt the smoothing state.
 4. **Smoothed wind** — `mean(rolling_buffer)`, falls back to raw on cold start
 5. **Persistence** — all fields written to SQLite including raw wind, smoothed wind, 4 depth temperatures, chlorophyll, and outlier flag
+=======
+1. **Pydantic validation**: rejects physically impossible values (negative wind, coordinates outside Lake Mendota bounding box, etc.)
+2. **Outlier detection**: flags `is_outlier=True` if `wind_speed_ms > 20.0` or `chlorophyll_ugl > 100.0`
+3. **Rolling buffer**: only clean readings enter the 10-point `deque`. Outliers are stored but never corrupt the smoothing state.
+4. **Smoothed wind**: `mean(rolling_buffer)`, falls back to raw on cold start
+5. **Persistence**: all fields written to SQLite including raw wind, smoothed wind, 4 depth temperatures, chlorophyll, and outlier flag
+>>>>>>> 61b6a90047afb6e455ed3bddb35f286b46dfed56
 
 ### Forecast
 
@@ -159,6 +175,7 @@ python scripts/fetch_ssec.py --live
 
 ## Design Notes
 
+<<<<<<< HEAD
 **Linear Regression for forecasting** — fits 100 records in under 1 ms, produces an interpretable slope (°C/s), and returns R² so callers can assess confidence. Appropriate for a slowly-changing limnological signal on a 5-minute horizon.
 
 **SQLite** — zero configuration, single-file portability, mirrors local storage on buoy shore-station hardware. Swappable for TimescaleDB or InfluxDB by changing `DATABASE_URL`.
@@ -166,6 +183,15 @@ python scripts/fetch_ssec.py --live
 **Outliers stored, not discarded** — quarantined from the rolling buffer and forecast regression, but kept in the database. Discarding them destroys the forensic record needed to correlate false HAB alerts with sensor fouling events.
 
 **Depth columns over JSON** — `water_temp_0m`, `water_temp_5m`, `water_temp_10m`, `water_temp_20m` as individual Float columns allows direct SQL aggregation for stratification queries without deserializing blobs.
+=======
+**Linear Regression for forecasting**: fits 100 records in under 1 ms, produces an interpretable slope (°C/s), and returns R² so callers can assess confidence. Appropriate for a slowly-changing limnological signal on a 5-minute horizon.
+
+**SQLite**: zero configuration, single-file portability, mirrors local storage on buoy shore-station hardware. Swappable for TimescaleDB or InfluxDB by changing `DATABASE_URL`.
+
+**Outliers stored, not discarded**: quarantined from the rolling buffer and forecast regression, but kept in the database. Discarding them destroys the forensic record needed to correlate false HAB alerts with sensor fouling events.
+
+**Depth columns over JSON**: `water_temp_0m`, `water_temp_5m`, `water_temp_10m`, `water_temp_20m` as individual Float columns allows direct SQL aggregation for stratification queries without deserializing blobs.
+>>>>>>> 61b6a90047afb6e455ed3bddb35f286b46dfed56
 
 ---
 
