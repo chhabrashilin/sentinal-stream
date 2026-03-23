@@ -78,6 +78,10 @@ def client():
     rolling_buffer.clear()
 
     with TestClient(app, raise_server_exceptions=True) as test_client:
+        # Clear again AFTER lifespan runs — the lifespan seeds rolling_buffer
+        # from the production DB (mendota_buoy.db), which would contaminate
+        # smoothing-math tests with real data from previous manual runs.
+        rolling_buffer.clear()
         yield test_client
 
     app.dependency_overrides.clear()

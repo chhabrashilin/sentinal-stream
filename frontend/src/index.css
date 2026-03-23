@@ -1,0 +1,54 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg-primary: #0a1628;
+  --bg-card: #0f2040;
+  --bg-card-hover: #162a50;
+  --border: #1e3a6e;
+  --text-primary: #e8f4fd;
+  --text-secondary: #7ab3d4;
+  --text-muted: #4a7a99;
+  --accent-blue: #2196f3;
+  --accent-teal: #00bcd4;
+  --accent-red: #c8102e;
+  --accent-green: #4caf50;
+  --accent-orange: #ff9800;
+  --accent-yellow: #ffc107;
+  --chart-wind-raw: #ff9800;
+  --chart-wind-smooth: #2196f3;
+  --chart-surface: #ef5350;
+  --chart-5m: #ff9800;
+  --chart-10m: #42a5f5;
+  --chart-20m: #26c6da;
+}
+
+body {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-primary); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.fade-in {
+  animation: fadeIn 0.3s ease-out;
+}
