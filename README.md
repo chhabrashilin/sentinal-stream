@@ -8,7 +8,7 @@ Demo recording: https://youtu.be/jjXKpOC2HC8
 ![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)
 ![Tests](https://img.shields.io/badge/tests-17%20passing-brightgreen)
 
-A full-stack environmental intelligence pipeline and live dashboard for the **UW-Madison SSEC / NTL-LTER Lake Mendota Buoy** (43.0988°N, 89.4045°W).
+A full-stack environmental intelligence pipeline and live dashboard using UW-Madison SSEC and NTL-LTER Lake Mendota Buoy data (43.0988°N, 89.4045°W).
 
 Sensor telemetry is ingested at 1 Hz, validated, filtered for outliers, smoothed, persisted, and served through a REST API. A React dashboard visualizes wind, water temperature at 4 depths, a 5-minute ML forecast, thermal stratification status, and real-time lake activity safety assessments.
 
