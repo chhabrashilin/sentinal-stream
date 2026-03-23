@@ -163,13 +163,13 @@ python scripts/fetch_ssec.py --live
 
 ## Design Notes
 
-**Linear Regression for forecasting** — fits 100 records in under 1 ms, produces an interpretable slope (°C/s), and returns R² so callers can assess confidence. Appropriate for a slowly-changing limnological signal on a 5-minute horizon.
+**Linear Regression for forecasting**: fits 100 records in under 1 ms, produces an interpretable slope (°C/s), and returns R² so callers can assess confidence. Appropriate for a slowly-changing limnological signal on a 5-minute horizon.
 
-**SQLite** — zero configuration, single-file portability, mirrors local storage on buoy shore-station hardware. Swappable for TimescaleDB or InfluxDB by changing `DATABASE_URL`.
+**SQLite**: zero configuration, single-file portability, mirrors local storage on buoy shore-station hardware. Swappable for TimescaleDB or InfluxDB by changing `DATABASE_URL`.
 
-**Outliers stored, not discarded** — quarantined from the rolling buffer and forecast regression, but kept in the database. Discarding them destroys the forensic record needed to correlate false HAB alerts with sensor fouling events.
+**Outliers stored, not discarded**: quarantined from the rolling buffer and forecast regression, but kept in the database. Discarding them destroys the forensic record needed to correlate false HAB alerts with sensor fouling events.
 
-**Depth columns over JSON** — `water_temp_0m`, `water_temp_5m`, `water_temp_10m`, `water_temp_20m` as individual Float columns allows direct SQL aggregation for stratification queries without deserializing blobs.
+**Depth columns over JSON**: `water_temp_0m`, `water_temp_5m`, `water_temp_10m`, `water_temp_20m` as individual Float columns allows direct SQL aggregation for stratification queries without deserializing blobs.
 
 ---
 
