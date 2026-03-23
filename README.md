@@ -1,5 +1,7 @@
 # Sentinel-Stream: Lake Mendota Digital Twin
 
+Demo recording: https://youtu.be/jjXKpOC2HC8
+
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688?logo=fastapi&logoColor=white)
 ![React](https://img.shields.io/badge/React-18.3-61dafb?logo=react&logoColor=black)
