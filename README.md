@@ -1,99 +1,126 @@
-# Sentinel-Stream: Mendota Edition
-### Real-Time Lake Environmental Intelligence Pipeline
+# Sentinel-Stream: Lake Mendota Digital Twin
+## Real-Time Environmental Intelligence Pipeline
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688?logo=fastapi&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)
 ![Tests](https://img.shields.io/badge/tests-17%20passing-brightgreen)
+![SSEC API](https://img.shields.io/badge/SSEC%20API-integrated-orange)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-> A high-frequency IoT data pipeline simulating the **NTL-LTER research buoy on Lake Mendota, Madison, WI**, featuring outlier-aware multivariate smoothing and ML-powered 5-minute surface water temperature forecasting.
-
-As a UW-Madison student, I built this as a digital twin of a sensor platform I can see from campus — the [SSEC / Center for Limnology NTL-LTER buoy](https://lter.limnology.wisc.edu/dataset/north-temperate-lakes-lter-high-frequency-data-meteorological-dissolved-oxygen-chlorophyll) anchored 1.5 km NE of Picnic Point.
-
-**Hardware Abstraction Layer:** Because the physical SSEC Mendota Buoy is currently off-station for the winter (confirmed via `GET /buoy-status` → SSEC API returns `status_code: 8, "Out for the season"`), I developed a high-fidelity emulator calibrated to historical SSEC datasets. It generates telemetry based on late-March post ice-out conditions — including vertical temperature profiles and chlorophyll-a concentrations — to allow for year-round model training and API testing. When the buoy returns to service (~May), a single command (`python scripts/fetch_ssec.py --live`) replaces the emulator with real hardware telemetry, no pipeline changes required.
+> **A production-grade, Edge-to-Cloud sensor pipeline** — a digital twin of the UW-Madison SSEC/NTL-LTER Lake Mendota Buoy (43.0988°N, 89.4045°W). Ingests 1 Hz multivariate telemetry, applies outlier-aware noise filtering, and delivers ML-powered 5-minute environmental forecasts. Built to mirror the real-time environmental intelligence architecture at the core of autonomous maritime operations.
 
 ---
 
-## Why This Project
+## The Problem This Solves
 
-Autonomous vehicles — whether surface vessels, underwater gliders, or aerial drones — live or die on the quality of their environmental situational awareness. A routing algorithm acting on raw, noisy sensor data risks unsafe decisions. A miscalibrated anemometer reporting 25 m/s winds during a 5 m/s breeze could abort a mission unnecessarily; a fouled fluorometer falsely signalling a harmful algal bloom (HAB) could trigger an incorrect no-sail zone.
+Autonomous surface vessels and environmental monitoring systems fail when their data layer fails. Raw sensor telemetry from lake and ocean buoys is:
 
-Sentinel-Stream tackles this exact problem at the data layer:
+- **Noisy** — thermistors, anemometers, and fluorometers all exhibit Gaussian measurement error
+- **Gappy** — RF packet loss over water is 10–20% under normal conditions
+- **Occasionally corrupted** — anemometer saturation, fluorometer lens fouling, GPS drift
 
-- The **emulator** generates 1 Hz multivariate telemetry with realistic Gaussian noise, 10% packet loss, and 5% outlier injection across both wind and chlorophyll channels.
-- The **ingest pipeline** validates, filters, and stores every packet — outliers are quarantined from the smoothing buffer but preserved in full for post-incident forensic analysis.
-- The **forecast endpoint** produces 5-minute surface water temperature predictions from a real-time linear regression, with an R² confidence score the calling system can use to decide whether to trust the prediction.
+A routing algorithm acting on bad data makes bad decisions. Sentinel-Stream is the **data reliability layer** that sits between raw hardware and any intelligent system that consumes environmental data.
 
-This mirrors the data-layer challenges that autonomous environmental intelligence systems face: reliable sensor fusion, real-time noise filtering, and actionable situational awareness for systems that cannot rely on a human in the loop.
+---
+
+## Hardware Abstraction Layer
+
+Because the physical [SSEC Mendota Buoy](http://metobs.ssec.wisc.edu/mendota/buoy/) is currently off-station for the winter — confirmed live via `GET /buoy-status`, which proxies the real SSEC API:
+
+```json
+{
+  "ssec_status_code": 8,
+  "ssec_status_message": "Out for the season",
+  "ssec_last_updated": "2025-11-19 20:27:38Z",
+  "pipeline_mode": "emulator",
+  "ssec_api_reachable": true
+}
+```
+
+...I developed a **high-fidelity Digital Twin emulator** calibrated to historical SSEC datasets. It generates telemetry based on real late-March post ice-out conditions — including vertical temperature profiles and chlorophyll-a — to allow year-round model training and API development. When the buoy returns to service (~May), a single command replaces the emulator with live hardware telemetry:
+
+```bash
+python scripts/fetch_ssec.py --live   # no pipeline changes required
+```
+
+This is standard practice in autonomous systems engineering: you build and validate the software stack against a high-fidelity digital twin so the hardware integration is a swap, not a rebuild.
+
+---
+
+## System Architecture
+
+```mermaid
+graph TD
+    subgraph "Edge Layer — Lake Mendota Buoy (43.0988°N, 89.4045°W)"
+        A["🛰️ Digital Twin Emulator\n(sensor_emulator.py)\nOR scripts/fetch_ssec.py --live"] -->|1 Hz JSON| B{"Chaos Engine\nFault Injection"}
+        B -->|Gaussian Noise + Dual Outliers| C[HTTP POST /ingest]
+        B -->|10% Packet Drop| D[💀 Dropped — gap tolerance test]
+    end
+
+    subgraph "Processing Layer — FastAPI Microservice"
+        C --> E[Pydantic Validation\nPhysical plausibility · Lat/lon bounds]
+        E --> F[Dual-Channel Outlier Detection\nwind > 20 m/s  OR  chl > 100 µg/L]
+        F --> G[10-Point Rolling Window\nclean wind readings only]
+        G --> H[Smoothed telemetry\nraw + smoothed stored side-by-side]
+    end
+
+    subgraph "Persistence & Intelligence Layer"
+        H --> I[(SQLite\nmendota_buoy.db\nfour depth columns)]
+        I --> J["GET /forecast\nSurface temp T+5 min"]
+        I --> K["GET /stratification\nThermocline strength Δt"]
+        I --> L["GET /buoy-status\nLive SSEC API proxy"]
+        J --> M["📈 Linear Regression\nR² confidence · rising/falling/stable"]
+    end
+
+    style A fill:#c8102e,stroke:#333,color:#fff
+    style I fill:#0479a8,stroke:#333,color:#fff
+    style M fill:#2d8a4e,stroke:#333,color:#fff
+```
+
+**Data flows in one direction:** edge hardware → validation → filtering → persistence → intelligence. Each layer has one job and fails cleanly when its contract is violated.
 
 ---
 
 ## Features
 
-- **1 Hz multivariate emulation** — atmospheric (air temp, wind) + sub-surface temperature vertical profile (0m, 5m, 10m, 20m) + chlorophyll-a concentration
-- **Thermal stratification modelling** — diurnal surface heating applied with depth-dependent attenuation, replicating Lake Mendota's spring epilimnion dynamics
-- **Dual-channel outlier detection** — wind outliers (>20 m/s, inland lake threshold) AND chlorophyll outliers (>100 µg/L, fluorometer fouling threshold) — either triggers quarantine
-- **Outlier-aware rolling average** — 10-point window exclusively over clean wind readings; outlier packets never corrupt subsequent smoothed values
-- **ML surface temperature forecasting** — scikit-learn Linear Regression predicts 0m water temperature 5 minutes ahead, with R² confidence score and rising/falling/stable trend
-- **Full audit trail** — raw and smoothed values, all depth temperatures, chlorophyll, and outlier flag stored side-by-side
-- **Lat/lon physical validation** — coordinates validated to the Lake Mendota bounding box; GPS spoofing or unit errors (e.g., degrees vs. radians) rejected at the boundary
-- **Docker Compose ready** — single command brings up API + sensor emulator with health-gated startup
-- **17-test pytest suite** — in-memory isolated DB per test, covering both outlier fault paths, smoothing math, forecast structure, and all validation constraints
+### Sensor Emulation
+- **1 Hz multivariate stream** — atmospheric (air temp, wind) + sub-surface temperature profile (0m, 5m, 10m, 20m) + chlorophyll-a
+- **Seasonally calibrated** — late March post ice-out: ~4°C isothermal profile with ±0.3°C diurnal heating (vs ±1.5°C summer); correct for Lake Mendota's current ice-off conditions
+- **Dual-channel chaos engineering** — wind outliers (anemometer saturation) AND chlorophyll outliers (fluorometer fouling), independently configurable via env vars
+
+### Data Reliability
+- **Outlier-aware rolling average** — 10-point window over clean wind readings only; a single bad packet never corrupts the next 10 smoothed values
+- **Full audit trail** — raw and smoothed values, all four depth temperatures, chlorophyll, and `is_outlier` flag stored side-by-side for post-incident forensic analysis
+- **Physical validation at the boundary** — Pydantic rejects impossible values (negative wind, lat outside Lake Mendota bounding box, impossible pressures) before they touch the database
+
+### Intelligence API
+- **`GET /forecast`** — scikit-learn Linear Regression on last 100 clean records; predicts surface (0m) water temperature 5 minutes ahead with R² confidence score
+- **`GET /stratification`** — computes thermocline strength (water_temp_0m − water_temp_20m) and returns `stratified` / `weakly_stratified` / `mixed`; currently reads `mixed` (Δt ≈ 0.6°C, accurate for post ice-out conditions)
+- **`GET /buoy-status`** — live proxy to the real SSEC MetObs API; `pipeline_mode` field tells callers whether data is synthetic or live hardware
+
+### Live Data Integration
+- **`scripts/fetch_ssec.py`** — connects to the real `metobs.ssec.wisc.edu` API; `--status` / `--historical` / `--live` modes; handles SSEC's pseudo-CSV format and maps `water_temp_N` sensor indices to thermistor chain depths
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology | Rationale |
+| Layer | Technology | Why |
 |---|---|---|
-| API framework | FastAPI 0.111 | Async-capable, auto-generated OpenAPI docs, native Pydantic v2 integration |
-| Data validation | Pydantic v2 | Field-level physical plausibility constraints; nested schema for depth profile |
-| ORM / persistence | SQLAlchemy 2.0 + SQLite | Zero-config edge storage; depth columns enable direct SQL aggregation on stratification data |
-| ML forecasting | scikit-learn LinearRegression | Interpretable slope coefficient; fits in <1 ms on edge hardware |
-| Data wrangling | pandas + NumPy | Relative-time feature engineering; Gaussian noise generation |
-| Sensor emulation | Python + NumPy | Diurnal cycles with depth-attenuated heating, controlled dual-channel fault injection |
-| Containerisation | Docker + Compose | Reproducible environment; health-gated multi-service startup |
-| Testing | pytest + httpx + StaticPool | Per-test in-memory DB isolation; no production state pollution |
-
----
-
-## Architecture
-
-```mermaid
-graph TD
-    subgraph "Edge Layer — Lake Mendota Buoy (43.0988°N, 89.4045°W)"
-        A["🛰️ NTL-LTER Emulator\n(sensor_emulator.py)"] -->|1Hz JSON Stream| B{"Chaos Engine"}
-        B -->|Gaussian Noise + Dual Outliers| C[HTTP POST /ingest]
-        B -->|10% Packet Drop| D[💀 Dropped Packet]
-    end
-
-    subgraph "Processing Layer — FastAPI Microservice"
-        C --> E[Pydantic Validation\nLat/lon bounds · Physical ranges]
-        E --> F[Outlier Detection\nwind > 20 m/s OR chl > 100 µg/L]
-        F --> G[10-Point Rolling Window\nclean wind readings only]
-        G --> H[Smoothing Algorithm\nfilters anemometer noise]
-    end
-
-    subgraph "Persistence & Intelligence"
-        H --> I[(SQLite Database\nmendota_buoy.db)]
-        I --> J[GET /forecast]
-        J --> K[Scikit-Learn\nLinear Regression on 0m temp]
-        K --> L["📈 5-Min Surface Temp Prediction\n+ Trend + R² Score"]
-    end
-
-    style A fill:#c8102e,stroke:#333,color:#fff
-    style I fill:#0479a8,stroke:#333,color:#fff
-    style L fill:#9f6,stroke:#333,color:#000
-```
+| API | FastAPI 0.111 | Async-native, auto-generated OpenAPI docs, native Pydantic v2 |
+| Validation | Pydantic v2 | Physical-plausibility constraints per field; nested schema for depth profile |
+| Persistence | SQLAlchemy 2.0 + SQLite | Zero-config edge storage; four depth columns enable direct SQL stratification queries |
+| ML | scikit-learn LinearRegression | <1 ms inference on edge hardware; interpretable slope = °C/s warming rate |
+| Data | pandas + NumPy | Relative-time feature engineering; depth-attenuated diurnal heating model |
+| Container | Docker + Compose | Health-gated multi-service startup; `sensor` depends on `api` health check |
+| Testing | pytest + httpx + StaticPool | Per-test in-memory DB isolation via dependency override; zero production state pollution |
 
 ---
 
 ## Sensor Schema
 
-Mirrors the [NTL-LTER Lake Mendota high-frequency buoy data product](https://lter.limnology.wisc.edu/dataset/north-temperate-lakes-lter-high-frequency-data-meteorological-dissolved-oxygen-chlorophyll).
-
-Values are calibrated to **late March post ice-out conditions** — Lake Mendota is nearly isothermal at ~4 °C immediately after losing ice cover, with stratification onset beginning in April:
+Mirrors the [NTL-LTER Lake Mendota high-frequency buoy data product](https://lter.limnology.wisc.edu/dataset/north-temperate-lakes-lter-high-frequency-data-meteorological-dissolved-oxygen-chlorophyll). Values calibrated to **late March post ice-out** — the water column is nearly isothermal at ~4°C before spring stratification begins:
 
 ```json
 {
@@ -113,142 +140,110 @@ Values are calibrated to **late March post ice-out conditions** — Lake Mendota
 }
 ```
 
-> **Units note:** The SSEC fluorometer reports raw Relative Fluorescence Units (RFU) which can read 5,000–15,000 RFU. These are **not** µg/L. The Turner Cyclops sensor used on the Mendota buoy applies a site-specific calibration factor (~0.001–0.003 µg/L per RFU). This pipeline stores the calibrated µg/L value.
+> **Units clarification:** The SSEC fluorometer reports raw Relative Fluorescence Units (RFU) which can read 5,000–15,000 RFU. These are **not** µg/L. The Turner Cyclops-7F sensor on the Mendota buoy uses a site-specific calibration factor (~0.001–0.003 µg/L/RFU). This pipeline stores calibrated µg/L values throughout.
 
 ---
 
-## Quick Start — Local
+## Quick Start
 
+### Local
 ```bash
-# 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Start the API (terminal 1)
+# Terminal 1 — start the API
 uvicorn main:app --reload
 
-# 3. Start the sensor emulator (terminal 2)
+# Terminal 2 — start the digital twin emulator
 python sensor_emulator.py
 
-# 4. View live API docs
+# Explore the live API docs
 open http://localhost:8000/docs
 ```
 
----
-
-## Quick Start — Docker
-
+### Docker (one command)
 ```bash
-# Build and launch both services with a single command
 docker-compose up --build
-
-# The sensor begins streaming automatically once the API passes its health check
+# Sensor emulator starts automatically once the API passes its health check
+# API docs: http://localhost:8000/docs
 ```
 
 ---
 
 ## API Reference
 
-| Method | Path | Description |
+| Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/ingest` | Ingest a validated buoy telemetry packet; returns smoothed wind, outlier flag, surface temp |
-| `GET` | `/forecast` | 5-minute surface water temperature forecast with R² confidence (requires ≥10 clean records) |
-| `GET` | `/stratification` | Thermocline strength (0m − 20m Δt) and stratification status: `stratified` / `weakly_stratified` / `mixed` |
-| `GET` | `/buoy-status` | Live proxy to the real SSEC MetObs API — shows whether the physical buoy is online or off-season |
-| `GET` | `/status` | Sentinel-Stream health probe — Docker healthcheck target |
-| `GET` | `/readings?n=20` | Retrieve the N most recent buoy records (with full depth profile) |
+| `POST` | `/ingest` | Ingest validated buoy telemetry; returns smoothed wind, outlier flag, surface temp |
+| `GET` | `/forecast` | 5-min surface water temp forecast — Linear Regression with R² confidence |
+| `GET` | `/stratification` | Thermocline strength (0m − 20m Δt); `stratified` / `weakly_stratified` / `mixed` |
+| `GET` | `/buoy-status` | Live proxy to SSEC MetObs API — `pipeline_mode: live` or `emulator` |
+| `GET` | `/status` | System health probe — Docker healthcheck target |
+| `GET` | `/readings?n=20` | Last N buoy records with full depth profile |
 | `GET` | `/docs` | Auto-generated interactive OpenAPI documentation |
 
 ---
 
 ## Chaos Engineering
 
-Three fault modes are injected by the emulator to exercise pipeline resilience:
-
-| Mode | Rate | Simulates | Pipeline Response |
+| Fault Mode | Rate | What It Simulates | Pipeline Response |
 |---|---|---|---|
-| Gaussian noise | Every packet | Thermistor / anemometer / fluorometer measurement error | Rolling average absorbs noise |
-| Packet drop | 10% | LoRaWAN RF packet loss through vegetation and terrain | API is stateless per-request; gaps cause no corruption |
-| Wind outlier | ~2.5% | Anemometer saturation from spray or mechanical fault | Flagged `is_outlier=True`, excluded from rolling buffer |
-| Chlorophyll outlier | ~2.5% | Fluorometer lens fouling from seasonal biofilm | Flagged `is_outlier=True`, excluded from forecast regression |
+| Gaussian noise | Every packet | Thermistor / anemometer / fluorometer instrument noise | Rolling average absorbs it |
+| Packet drop | 10% | LoRaWAN / Wi-Fi loss between buoy and shore station | Stateless per-request API; gaps cause no state corruption |
+| Wind outlier | ~2.5% | Anemometer saturation (spray, mechanical fault) | `is_outlier=True`, excluded from rolling buffer and forecast |
+| Chlorophyll outlier | ~2.5% | Fluorometer lens fouling from seasonal biofilm | `is_outlier=True`, excluded from forecast regression |
+
+All rates are tunable via environment variables (`PACKET_DROP_RATE`, `OUTLIER_RATE`) without restarting the emulator.
 
 ---
 
 ## Design Decisions
 
 **Why Linear Regression for `/forecast`?**
-In edge-compute environments — a shore-station Raspberry Pi or the processing unit on an autonomous surface vessel — compute budget matters. Linear regression fits the last 100 records in under 1 ms, returning an interpretable slope coefficient (°C/s surface warming rate) that operators and autonomous systems can sanity-check against known seasonal dynamics. The R² score provides a built-in confidence signal: if R² < 0.5, the caller should widen its uncertainty bounds.
+In edge-compute environments — a shore-station SBC or the compute unit on an autonomous surface vessel — inference latency and resource consumption matter. Linear regression fits 100 records in <1 ms, produces an interpretable slope coefficient (°C/s surface warming rate) that operators can sanity-check against known seasonal dynamics, and provides an R² confidence score the calling system can use to decide whether to trust the prediction. A Deep Learning model would be overkill for a 5-minute horizon on a slowly-changing limnological signal.
 
-**Why SQLite?**
-Zero configuration, no daemon, single-file portability. This mirrors how environmental data is typically stored locally on buoy electronics or shore-station edge computers before being batch-synced to a central archive (e.g., the UW-Madison SSEC data servers). The same API contract supports a TimescaleDB or InfluxDB swap-in for a multi-buoy fleet deployment.
+**Why SQLite over a time-series database?**
+Zero configuration, no daemon, single-file portability. This mirrors how environmental data is stored locally on buoy electronics or shore-station edge computers before batch-sync to a central archive (e.g., the UW-Madison SSEC data servers). The API contract is designed so a TimescaleDB or InfluxDB drop-in requires only changing `DATABASE_URL` — the endpoints and schemas are unchanged.
 
-**Why store outliers rather than discard them?**
-Outliers are quarantined from the rolling buffer and regression (to protect analytics), but stored in full with `is_outlier=True`. This enables post-incident forensic analysis — for example, correlating a false HAB alert with a fluorometer fouling event — without resorting to log files.
+**Why store outliers instead of discarding them?**
+Quarantining outliers from the smoothing buffer and forecast regression protects analytics. But discarding them would destroy the forensic record — you can't correlate a false harmful algal bloom alert with a fluorometer fouling event if the event was never persisted. Every packet is stored; only the `is_outlier` flag determines whether it influences downstream analytics.
 
-**Why separate DB columns for each depth?**
-Storing `water_temp_0m`, `water_temp_5m`, `water_temp_10m`, `water_temp_20m` as individual Float columns (rather than a JSON blob) allows direct SQL aggregation on stratification metrics — e.g., thermocline strength = `water_temp_0m - water_temp_20m` — without full-row deserialization.
+**Why separate DB columns per depth?**
+`water_temp_0m`, `water_temp_5m`, `water_temp_10m`, `water_temp_20m` as individual Float columns allows direct SQL aggregation on stratification metrics (`water_temp_0m - water_temp_20m`) without deserializing JSON blobs. This matters when querying stratification trends across thousands of records for seasonal analysis.
 
 ---
 
 ## Testing
 
 ```bash
-# Run the full test suite
-pytest tests/ -v
-
-# 17 tests — all passing
+pytest tests/ -v   # 17 tests, all passing
 ```
 
-Tests cover:
-- Valid multivariate packet ingestion
-- Wind outlier detection (>20 m/s)
-- Chlorophyll outlier detection (>100 µg/L)
-- Rolling average arithmetic correctness
-- Outlier exclusion from rolling buffer
-- Surface water temperature echoed in response
-- Forecast 422 on insufficient data
-- Forecast rising-trend correctness
-- Status health probe
-- Record count increment
-- Pydantic validation: missing field, lat out-of-range, negative wind, negative chlorophyll, empty body
-- Readings endpoint: empty DB and depth profile structure
+| Test Class | Coverage |
+|---|---|
+| `TestIngestEndpoint` | Valid ingest, wind outlier, chlorophyll outlier, rolling average math, outlier buffer exclusion, surface temp echo |
+| `TestForecastEndpoint` | 422 on insufficient data, rising-trend structure validation |
+| `TestStatusEndpoint` | Health probe, record count increment |
+| `TestPydanticValidation` | Missing field, lat out-of-range, negative wind, negative chlorophyll, empty body |
+| `TestReadingsEndpoint` | Empty DB, full depth profile structure in response |
+
+Each test gets a **fresh in-memory SQLite database** via `StaticPool` + `app.dependency_overrides` — no shared state, no production file pollution.
 
 ---
 
 ## Live Data Integration
 
-The pipeline switches seamlessly between the synthetic emulator and real SSEC hardware telemetry.
-
-### Check buoy status (works any time)
 ```bash
+# Check real SSEC buoy status (works any time, year-round)
 python scripts/fetch_ssec.py --status
-# or via the API:
-curl http://localhost:8000/buoy-status
-```
 
-The `/buoy-status` endpoint proxies the real SSEC MetObs API live.  Current response (off-season):
-```json
-{
-  "ssec_status_code": 8,
-  "ssec_status_message": "Out for the season",
-  "ssec_last_updated": "2025-11-19 20:27:38Z",
-  "pipeline_mode": "emulator",
-  "ssec_api_reachable": true
-}
-```
+# Seed DB with real July 2024 summer data
+python scripts/fetch_ssec.py --historical --begin 2024-07-01 --end 2024-07-31
 
-### Seed with real historical data (summer seasons)
-```bash
-# Load July 2024 at 1-minute resolution — trains the forecast on real Mendota data
-python scripts/fetch_ssec.py --historical --begin 2024-07-01 --end 2024-07-31 --interval 1m
-```
-
-### Live mode (when buoy returns to service, ~May each year)
-```bash
-# Replaces the synthetic emulator with real hardware telemetry at 1-minute intervals
+# Live mode — replace emulator with real hardware (buoy online ~May–Nov)
 python scripts/fetch_ssec.py --live
 ```
 
-### Real SSEC API endpoints (verified)
+**Verified SSEC API endpoints:**
 ```
 Status:  GET http://metobs.ssec.wisc.edu/api/status/mendota/buoy.json
 Data:    GET http://metobs.ssec.wisc.edu/api/data.csv
@@ -262,7 +257,13 @@ Data:    GET http://metobs.ssec.wisc.edu/api/data.csv
 
 ## Data Reference
 
-- **Buoy dataset**: [NTL-LTER High-Frequency Meteorological, Dissolved Oxygen, and Chlorophyll Data](https://lter.limnology.wisc.edu/dataset/north-temperate-lakes-lter-high-frequency-data-meteorological-dissolved-oxygen-chlorophyll)
-- **Live data API**: [SSEC MetObs](http://metobs.ssec.wisc.edu/mendota/buoy/) — `metobs.ssec.wisc.edu`
-- **Operator**: UW-Madison Space Science and Engineering Center (SSEC) + Center for Limnology
-- **Buoy position**: 43.0988° N, 89.4045° W — 1.5 km NE of Picnic Point, Lake Mendota, Madison, WI
+| Resource | Link |
+|---|---|
+| NTL-LTER buoy dataset | [High-Frequency Met, DO, and Chlorophyll Data](https://lter.limnology.wisc.edu/dataset/north-temperate-lakes-lter-high-frequency-data-meteorological-dissolved-oxygen-chlorophyll) |
+| Live SSEC data portal | [metobs.ssec.wisc.edu/mendota/buoy](http://metobs.ssec.wisc.edu/mendota/buoy/) |
+| Buoy operator | UW-Madison Space Science and Engineering Center (SSEC) + Center for Limnology |
+| Buoy position | 43.0988° N, 89.4045° W — 1.5 km NE of Picnic Point, Lake Mendota |
+
+---
+
+*Built by a UW-Madison student as a demonstration of Edge-to-Cloud IoT architecture, real-time environmental intelligence, and autonomous systems data reliability engineering.*
