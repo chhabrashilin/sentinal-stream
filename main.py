@@ -689,7 +689,7 @@ def get_status(db: Session = Depends(get_db)) -> StatusResponse:
         status="healthy",
         record_count=record_count,
         latest_reading=latest,
-        system="Sentinel-Stream Mendota v2.0.0 — Lake Mendota NTL-LTER digital twin",
+        system="Sentinel-Stream Mendota v2.0.0 | Lake Mendota NTL-LTER digital twin",
     )
 
 

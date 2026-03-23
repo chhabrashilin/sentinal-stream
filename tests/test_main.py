@@ -99,7 +99,7 @@ def _valid_payload(**overrides) -> dict:
     """
     base: dict = {
         "timestamp": "2026-03-22T20:27:00Z",
-        "location": "Lake Mendota — 1.5 km NE of Picnic Point, Madison, WI",
+        "location": "Lake Mendota, 1.5 km NE of Picnic Point, Madison, WI",
         "lat": 43.0988,
         "long": -89.4045,
         "air_temp_c": 12.5,

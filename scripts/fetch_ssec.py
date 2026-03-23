@@ -98,7 +98,7 @@ SENTINEL_INGEST_URL: str = "http://localhost:8000/ingest"
 # Buoy location (from SSEC metadata)
 BUOY_LAT: float = 43.0988
 BUOY_LON: float = -89.4045
-BUOY_LOCATION: str = "Lake Mendota — 1.5 km NE of Picnic Point, Madison, WI"
+BUOY_LOCATION: str = "Lake Mendota, 1.5 km NE of Picnic Point, Madison, WI"
 
 # Outlier thresholds — must match main.py constants
 WIND_OUTLIER_THRESHOLD_MS: float = 20.0

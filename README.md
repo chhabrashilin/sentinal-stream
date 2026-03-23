@@ -1,6 +1,6 @@
 # Sentinel-Stream: Lake Mendota Digital Twin
 
-**Real-Time Environmental Intelligence Pipeline — Full-Stack**
+**Real-Time Environmental Intelligence Pipeline | Full-Stack**
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688?logo=fastapi&logoColor=white)
@@ -10,9 +10,9 @@
 ![SSEC API](https://img.shields.io/badge/SSEC%20API-integrated-orange)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-A full-stack IoT data pipeline and live dashboard — a digital twin of the **UW-Madison SSEC / NTL-LTER Lake Mendota Buoy** (43.0988°N, 89.4045°W). The system ingests 1 Hz multivariate sensor telemetry, applies outlier-aware noise filtering, persists to a local database, serves ML-powered environmental forecasts via a REST API, and visualizes everything in a real-time React dashboard.
+A full-stack IoT data pipeline and live dashboard: a digital twin of the **UW-Madison SSEC / NTL-LTER Lake Mendota Buoy** (43.0988°N, 89.4045°W). The system ingests 1 Hz multivariate sensor telemetry, applies outlier-aware noise filtering, persists to a local database, serves ML-powered environmental forecasts via a REST API, and visualizes everything in a real-time React dashboard.
 
-Built as a portfolio project demonstrating Edge-to-Cloud IoT architecture, real-time data reliability engineering, and autonomous systems intelligence for a Mantari Software Engineering internship application.
+Demonstrates Edge-to-Cloud IoT architecture, real-time data reliability engineering, ML-powered environmental forecasting, and full-stack systems integration.
 
 ---
 
@@ -20,9 +20,9 @@ Built as a portfolio project demonstrating Edge-to-Cloud IoT architecture, real-
 
 | Component | Live? | Details |
 |---|---|---|
-| `GET /buoy-status` | **Yes — real** | Hits `metobs.ssec.wisc.edu` and returns the actual SSEC status JSON |
-| Sensor telemetry | **No — synthetic** | The physical buoy has been off-station since Nov 19, 2025 (`status_code: 8, "Out for the season"`). `sensor_emulator.py` generates synthetic 1 Hz data calibrated to late-March post ice-out conditions. |
-| `scripts/fetch_ssec.py --live` | **Yes, when buoy is online** | When the buoy returns (~May), this command replaces the emulator with real SSEC hardware telemetry — no pipeline changes needed. |
+| `GET /buoy-status` | **Yes (live)** | Hits `metobs.ssec.wisc.edu` and returns the actual SSEC status JSON |
+| Sensor telemetry | **No (synthetic)** | The physical buoy has been off-station since Nov 19, 2025 (`status_code: 8, "Out for the season"`). `sensor_emulator.py` generates synthetic 1 Hz data calibrated to late-March post ice-out conditions. |
+| `scripts/fetch_ssec.py --live` | **Yes, when buoy is online** | When the buoy returns (~May), this command replaces the emulator with real SSEC hardware telemetry, no pipeline changes needed. |
 
 ---
 
@@ -30,7 +30,7 @@ Built as a portfolio project demonstrating Edge-to-Cloud IoT architecture, real-
 
 ```
 sentinal-stream/
-├── main.py                  # FastAPI backend — 6 endpoints
+├── main.py                  # FastAPI backend (6 endpoints)
 ├── sensor_emulator.py       # 1 Hz synthetic buoy emulator (digital twin)
 ├── requirements.txt         # Python dependencies
 ├── Dockerfile               # Container image for the API
@@ -41,7 +41,7 @@ sentinal-stream/
 │   └── fetch_ssec.py        # Real SSEC API integration (--status / --historical / --live)
 │
 ├── tests/
-│   └── test_main.py         # 17 pytest tests — all passing
+│   └── test_main.py         # 17 pytest tests, all passing
 │
 └── frontend/
     ├── package.json         # React 18 + Recharts + Vite
@@ -49,12 +49,12 @@ sentinal-stream/
     ├── index.html
     └── src/
         ├── main.jsx
-        ├── App.jsx          # Main dashboard — polls all endpoints every 2s
+        ├── App.jsx          # Main dashboard, polls all endpoints every 2s
         ├── index.css        # Dark maritime theme (CSS variables)
         └── components/
             ├── MetricCard.jsx        # KPI cards (air temp, wind, etc.)
-            ├── WindChart.jsx         # Raw vs smoothed wind — Recharts LineChart
-            ├── DepthProfile.jsx      # Water temp at 0m/5m/10m/20m — horizontal BarChart
+            ├── WindChart.jsx         # Raw vs smoothed wind, Recharts LineChart
+            ├── DepthProfile.jsx      # Water temp at 0m/5m/10m/20m, horizontal BarChart
             ├── ForecastCard.jsx      # T+5 min prediction, trend, R² bar
             ├── StratificationCard.jsx# Thermocline Δt, stratification status badge
             └── LiveFeed.jsx          # Last 8 readings table with outlier badges
@@ -71,7 +71,7 @@ graph TD
         A -->|POST JSON every second| B
     end
 
-    subgraph "Processing Layer — FastAPI :8000"
+    subgraph "Processing Layer | FastAPI :8000"
         B[POST /ingest]
         B --> C[Pydantic validation\nphysical plausibility · lat/lon bounds]
         C --> D{Outlier?\nwind > 20 m/s\nOR chl > 100 µg/L}
@@ -89,7 +89,7 @@ graph TD
         L[GET /buoy-status\nLive proxy → metobs.ssec.wisc.edu]
     end
 
-    subgraph "Presentation Layer — React :5173"
+    subgraph "Presentation Layer | React :5173"
         M[Dashboard\nPolls all endpoints every 2s]
         H --> M
         I --> M
@@ -105,7 +105,7 @@ graph TD
 
 ---
 
-## Backend — `main.py`
+## Backend: `main.py`
 
 ### Endpoints
 
@@ -123,11 +123,11 @@ graph TD
 
 Accepts the buoy telemetry schema, runs it through a 5-step processing pipeline:
 
-1. **Pydantic validation** — rejects impossible values before touching the DB (negative wind, lat outside Lake Mendota bounding box, etc.)
-2. **Outlier detection** — flags `is_outlier=True` if `wind_speed_ms > 20.0` OR `chlorophyll_ugl > 100.0`
-3. **Rolling buffer update** — only clean (non-outlier) readings enter the 10-point `deque(maxlen=10)`. Outliers are stored but never corrupt the smoothing state.
-4. **Smoothed wind calculation** — `mean(rolling_buffer)`. Falls back to raw value on cold start.
-5. **SQLite persistence** — all fields stored including raw wind, smoothed wind, all 4 depth temperatures, chlorophyll, and outlier flag.
+1. **Pydantic validation**: rejects impossible values before touching the DB (negative wind, lat outside Lake Mendota bounding box, etc.)
+2. **Outlier detection**: flags `is_outlier=True` if `wind_speed_ms > 20.0` OR `chlorophyll_ugl > 100.0`
+3. **Rolling buffer update**: only clean (non-outlier) readings enter the 10-point `deque(maxlen=10)`. Outliers are stored but never corrupt the smoothing state.
+4. **Smoothed wind calculation**: `mean(rolling_buffer)`. Falls back to raw value on cold start.
+5. **SQLite persistence**: all fields stored including raw wind, smoothed wind, all 4 depth temperatures, chlorophyll, and outlier flag.
 
 **Response:**
 ```json
@@ -202,9 +202,9 @@ When `ssec_status_code == 0`, `pipeline_mode` becomes `"live"`.
 
 ---
 
-## Sensor Emulator — `sensor_emulator.py`
+## Sensor Emulator: `sensor_emulator.py`
 
-Simulates the SSEC NTL-LTER buoy at 1 Hz. Values are calibrated to **late-March post ice-out conditions** — Lake Mendota loses ice cover in mid-to-late March and sits nearly isothermal at ~4°C before spring stratification begins.
+Simulates the SSEC NTL-LTER buoy at 1 Hz. Values are calibrated to **late-March post ice-out conditions**. Lake Mendota loses ice cover in mid-to-late March and sits nearly isothermal at ~4°C before spring stratification begins.
 
 ### Baseline values (late March)
 
@@ -212,7 +212,7 @@ Simulates the SSEC NTL-LTER buoy at 1 Hz. Values are calibrated to **late-March 
 |---|---|---|---|
 | Air temperature | 6.0°C | ±0.25°C | ±4°C diurnal swing over 24h |
 | Wind speed | 6.0 m/s | ±0.4 m/s | Prevailing SW winds on Mendota |
-| Water temp 0m | 4.0°C | ±0.15°C | Surface — post ice-out |
+| Water temp 0m | 4.0°C | ±0.15°C | Surface (post ice-out) |
 | Water temp 5m | 3.8°C | ±0.15°C | Nearly isothermal |
 | Water temp 10m | 3.6°C | ±0.15°C | Metalimnion |
 | Water temp 20m | 3.4°C | ±0.15°C | Hypolimnion |
@@ -231,14 +231,14 @@ Three fault modes are injected to exercise pipeline resilience:
 | Wind outlier | ~2.5% | Anemometer saturation (spray, mechanical fault) | `is_outlier=True`, excluded from buffer and forecast |
 | Chlorophyll outlier | ~2.5% | Fluorometer lens fouling from seasonal biofilm | `is_outlier=True`, excluded from buffer and forecast |
 
-All rates are configurable via environment variables — no restart needed:
+All rates are configurable via environment variables (no restart needed):
 ```bash
 PACKET_DROP_RATE=0.20 OUTLIER_RATE=0.10 python sensor_emulator.py
 ```
 
 ---
 
-## Frontend Dashboard — `frontend/`
+## Frontend Dashboard: `frontend/`
 
 Built with **React 18 + Vite + Recharts**. Dark maritime theme. Polls all backend endpoints every 2 seconds.
 
@@ -247,13 +247,13 @@ Built with **React 18 + Vite + Recharts**. Dark maritime theme. Polls all backen
 | Component | Chart type | Data source |
 |---|---|---|
 | `MetricCard` | KPI cards | `/readings` latest record |
-| `WindChart` | Line chart — raw (orange dashed) vs smoothed (blue solid) | `/readings?n=60` |
-| `DepthProfile` | Horizontal bar chart — warm-to-cool color gradient | `/readings` latest depth profile |
+| `WindChart` | Line chart: raw (orange dashed) vs smoothed (blue solid) | `/readings?n=60` |
+| `DepthProfile` | Horizontal bar chart, warm-to-cool color gradient | `/readings` latest depth profile |
 | `ForecastCard` | Current temp → T+5 min, trend arrow, R² progress bar | `/forecast` |
 | `StratificationCard` | Thermocline Δt, color-coded status badge | `/stratification` |
-| `LiveFeed` | Table — last 8 readings, outlier badges | `/readings?n=8` |
+| `LiveFeed` | Table of last 8 readings, with outlier badges | `/readings?n=8` |
 
-The dashboard also shows a **buoy status banner** from `/buoy-status` — currently displays "Out for the season" with `pipeline_mode: emulator`.
+The dashboard also shows a **buoy status banner** from `/buoy-status`, currently displaying "Out for the season" with `pipeline_mode: emulator`.
 
 All components handle three states: loading (skeleton), empty/insufficient data (graceful message), and populated.
 
@@ -261,12 +261,12 @@ All components handle three states: loading (skeleton), empty/insufficient data 
 
 ## Sensor Schema
 
-The telemetry packet format — matches the real SSEC buoy variable names:
+The telemetry packet format, matching the real SSEC buoy variable names:
 
 ```json
 {
   "timestamp": "2026-03-22T20:27:00Z",
-  "location": "Lake Mendota — 1.5 km NE of Picnic Point, Madison, WI",
+  "location": "Lake Mendota, 1.5 km NE of Picnic Point, Madison, WI",
   "lat": 43.0988,
   "long": -89.4045,
   "air_temp_c": 6.0,
@@ -282,7 +282,7 @@ The telemetry packet format — matches the real SSEC buoy variable names:
 ```
 
 Pydantic validation enforces:
-- `lat` in [42.9, 43.2] — Lake Mendota bounding box
+- `lat` in [42.9, 43.2] (Lake Mendota bounding box)
 - `long` in [−89.6, −89.3]
 - `wind_speed_ms` in [0.0, 60.0]
 - `chlorophyll_ugl` in [0.0, 1000.0]
@@ -300,7 +300,7 @@ Pydantic validation enforces:
 
 ### Local (3 terminals)
 
-**Terminal 1 — API:**
+**Terminal 1: API**
 ```bash
 pip install -r requirements.txt
 uvicorn main:app --reload
@@ -308,14 +308,14 @@ uvicorn main:app --reload
 # Interactive docs at http://localhost:8000/docs
 ```
 
-**Terminal 2 — Sensor emulator:**
+**Terminal 2: Sensor emulator**
 ```bash
 python sensor_emulator.py
 # Streams 1 packet/second to /ingest
 # Wait ~15 seconds before /forecast and /stratification have enough data
 ```
 
-**Terminal 3 — Dashboard:**
+**Terminal 3: Dashboard**
 ```bash
 cd frontend
 npm install      # first time only
@@ -338,7 +338,7 @@ docker-compose up --build
 pytest tests/ -v
 ```
 
-17 tests, all passing. Each test gets a **fresh in-memory SQLite database** via `StaticPool` + `app.dependency_overrides[get_db]` — no shared state, no writes to `mendota_buoy.db`.
+17 tests, all passing. Each test gets a **fresh in-memory SQLite database** via `StaticPool` + `app.dependency_overrides[get_db]` -- no shared state, no writes to `mendota_buoy.db`.
 
 | Test class | What it covers |
 |---|---|
@@ -391,16 +391,16 @@ python scripts/fetch_ssec.py --live
 Edge-compute environments (shore-station SBC, autonomous vessel compute unit) have constrained resources. Linear Regression fits 100 records in < 1 ms, produces an interpretable slope coefficient (°C/s warming rate), and returns an R² score the calling system uses to decide whether to trust the prediction. A neural network would be overkill for a 5-minute horizon on a slowly-changing limnological signal.
 
 **Why SQLite?**
-Zero configuration, no daemon, single-file portability — mirrors how data is stored locally on buoy electronics before batch-sync to a central archive. The same API contract supports TimescaleDB or InfluxDB by changing one line (`DATABASE_URL`).
+Zero configuration, no daemon, single-file portability; mirrors how data is stored locally on buoy electronics before batch-sync to a central archive. The same API contract supports TimescaleDB or InfluxDB by changing one line (`DATABASE_URL`).
 
 **Why store outliers instead of discarding them?**
-Quarantining outliers from the rolling buffer and forecast regression protects analytics. Discarding them destroys the forensic record — you cannot correlate a false HAB alert with a fluorometer fouling event if the packet was never persisted. Every packet is stored; `is_outlier` determines its influence on downstream analytics.
+Quarantining outliers from the rolling buffer and forecast regression protects analytics. Discarding them destroys the forensic record: you cannot correlate a false HAB alert with a fluorometer fouling event if the packet was never persisted. Every packet is stored; `is_outlier` determines its influence on downstream analytics.
 
 **Why separate DB columns per depth instead of JSON?**
 `water_temp_0m`, `water_temp_5m`, `water_temp_10m`, `water_temp_20m` as individual Float columns allows direct SQL aggregation (`water_temp_0m - water_temp_20m`) without deserializing blobs. Critical for querying stratification trends across thousands of records.
 
 **Why post ice-out baselines?**
-Lake Mendota's ice-off date is mid-to-late March (UW-Madison has tracked it since 1855). Right now, the water column sits nearly isothermal at ~4°C — the temperature of maximum density — because winter mixing has erased all stratification. `/stratification` correctly returns `mixed` with Δt ≈ 0.6°C. Summer values (surface ~24°C, 20m ~7°C, Δt ~17°C) are available by seeding with historical data via `fetch_ssec.py --historical`.
+Lake Mendota's ice-off date is mid-to-late March (UW-Madison has tracked it since 1855). Right now, the water column sits nearly isothermal at ~4°C (the temperature of maximum density), because winter mixing has erased all stratification. `/stratification` correctly returns `mixed` with Δt ≈ 0.6°C. Summer values (surface ~24°C, 20m ~7°C, Δt ~17°C) are available by seeding with historical data via `fetch_ssec.py --historical`.
 
 ---
 
@@ -421,7 +421,7 @@ Lake Mendota's ice-off date is mid-to-late March (UW-Madison has tracked it sinc
 | Frontend framework | React | 18.3.1 |
 | Frontend build | Vite | 5.4.2 |
 | Charts | Recharts | 2.12.7 |
-| Container | Docker + Compose | — |
+| Container | Docker + Compose | bundled |
 
 ---
 
@@ -432,9 +432,9 @@ Lake Mendota's ice-off date is mid-to-late March (UW-Madison has tracked it sinc
 | NTL-LTER buoy dataset | [High-Frequency Met, DO, and Chlorophyll Data](https://lter.limnology.wisc.edu/dataset/north-temperate-lakes-lter-high-frequency-data-meteorological-dissolved-oxygen-chlorophyll) |
 | SSEC live data portal | [metobs.ssec.wisc.edu/mendota/buoy](http://metobs.ssec.wisc.edu/mendota/buoy/) |
 | Buoy operator | UW-Madison Space Science and Engineering Center (SSEC) + Center for Limnology |
-| Buoy coordinates | 43.0988°N, 89.4045°W — 1.5 km NE of Picnic Point, Lake Mendota, Madison, WI |
+| Buoy coordinates | 43.0988°N, 89.4045°W, 1.5 km NE of Picnic Point, Lake Mendota, Madison, WI |
 | Buoy current status | Off-station (`status_code: 8`) since 2025-11-19; returns to service ~May |
 
 ---
 
-*Built by a UW-Madison student as a full-stack demonstration of Edge-to-Cloud IoT architecture, real-time sensor data reliability, and environmental intelligence engineering.*
+*UW-Madison · [NTL-LTER](https://lter.limnology.wisc.edu/) · Lake Mendota*

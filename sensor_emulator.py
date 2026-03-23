@@ -62,7 +62,7 @@ INGEST_ENDPOINT: str = f"{API_URL}/ingest"
 # Source: UW-Madison SSEC / Center for Limnology buoy metadata.
 BUOY_LAT: float = 43.0988   # degrees North
 BUOY_LON: float = -89.4045  # degrees West (negative = West)
-BUOY_LOCATION: str = "Lake Mendota — 1.5 km NE of Picnic Point, Madison, WI"
+BUOY_LOCATION: str = "Lake Mendota, 1.5 km NE of Picnic Point, Madison, WI"
 
 # ---------------------------------------------------------------------------
 # Environmental baselines — late March (post ice-out) for Lake Mendota
