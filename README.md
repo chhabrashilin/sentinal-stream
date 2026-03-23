@@ -144,10 +144,12 @@ docker-compose up --build
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/ingest` | Ingest a validated buoy telemetry packet; returns smoothed wind and outlier flag |
-| `GET` | `/forecast` | 5-minute surface water temperature forecast (requires ≥10 clean records) |
-| `GET` | `/status` | System health probe — Docker healthcheck target |
-| `GET` | `/readings?n=20` | Retrieve the N most recent buoy records |
+| `POST` | `/ingest` | Ingest a validated buoy telemetry packet; returns smoothed wind, outlier flag, surface temp |
+| `GET` | `/forecast` | 5-minute surface water temperature forecast with R² confidence (requires ≥10 clean records) |
+| `GET` | `/stratification` | Thermocline strength (0m − 20m Δt) and stratification status: `stratified` / `weakly_stratified` / `mixed` |
+| `GET` | `/buoy-status` | Live proxy to the real SSEC MetObs API — shows whether the physical buoy is online or off-season |
+| `GET` | `/status` | Sentinel-Stream health probe — Docker healthcheck target |
+| `GET` | `/readings?n=20` | Retrieve the N most recent buoy records (with full depth profile) |
 | `GET` | `/docs` | Auto-generated interactive OpenAPI documentation |
 
 ---
@@ -206,10 +208,55 @@ Tests cover:
 
 ---
 
+## Live Data Integration
+
+The pipeline switches seamlessly between the synthetic emulator and real SSEC hardware telemetry.
+
+### Check buoy status (works any time)
+```bash
+python scripts/fetch_ssec.py --status
+# or via the API:
+curl http://localhost:8000/buoy-status
+```
+
+The `/buoy-status` endpoint proxies the real SSEC MetObs API live.  Current response (off-season):
+```json
+{
+  "ssec_status_code": 8,
+  "ssec_status_message": "Out for the season",
+  "ssec_last_updated": "2025-11-19 20:27:38Z",
+  "pipeline_mode": "emulator",
+  "ssec_api_reachable": true
+}
+```
+
+### Seed with real historical data (summer seasons)
+```bash
+# Load July 2024 at 1-minute resolution — trains the forecast on real Mendota data
+python scripts/fetch_ssec.py --historical --begin 2024-07-01 --end 2024-07-31 --interval 1m
+```
+
+### Live mode (when buoy returns to service, ~May each year)
+```bash
+# Replaces the synthetic emulator with real hardware telemetry at 1-minute intervals
+python scripts/fetch_ssec.py --live
+```
+
+### Real SSEC API endpoints (verified)
+```
+Status:  GET http://metobs.ssec.wisc.edu/api/status/mendota/buoy.json
+Data:    GET http://metobs.ssec.wisc.edu/api/data.csv
+             ?site=mendota&inst=buoy
+             &symbols=air_temp:wind_speed:water_temp_1:water_temp_5:
+                      water_temp_7:water_temp_9:chlorophyll:phycocyanin
+             &begin=2024-07-01T00:00:00Z&end=2024-07-31T23:59:59Z&interval=1m
+```
+
+---
+
 ## Data Reference
 
-This project is modelled on publicly available NTL-LTER data from the UW-Madison Center for Limnology:
-
 - **Buoy dataset**: [NTL-LTER High-Frequency Meteorological, Dissolved Oxygen, and Chlorophyll Data](https://lter.limnology.wisc.edu/dataset/north-temperate-lakes-lter-high-frequency-data-meteorological-dissolved-oxygen-chlorophyll)
+- **Live data API**: [SSEC MetObs](http://metobs.ssec.wisc.edu/mendota/buoy/) — `metobs.ssec.wisc.edu`
 - **Operator**: UW-Madison Space Science and Engineering Center (SSEC) + Center for Limnology
 - **Buoy position**: 43.0988° N, 89.4045° W — 1.5 km NE of Picnic Point, Lake Mendota, Madison, WI

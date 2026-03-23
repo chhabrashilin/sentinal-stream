@@ -23,8 +23,10 @@ Architecture overview
          predicts surface water temperature (0m) 5 minutes ahead.
          Returns trend direction and R² confidence score.
 
-  GET /status     ← health probe (Docker healthcheck target)
-  GET /readings   ← recent record retrieval for dashboards / debugging
+  GET /status         ← health probe (Docker healthcheck target)
+  GET /readings       ← recent record retrieval for dashboards / debugging
+  GET /stratification ← thermocline strength computed from depth profile
+  GET /buoy-status    ← live proxy to the real SSEC MetObs status API
 
 Design decisions are documented inline and in README.md.
 """
@@ -39,6 +41,7 @@ from typing import Any, AsyncGenerator, Deque, Optional
 
 import numpy as np
 import pandas as pd
+import requests as http_requests
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from sklearn.linear_model import LinearRegression
@@ -287,6 +290,36 @@ class ReadingsResponse(BaseModel):
 
     count: int
     readings: list[dict[str, Any]]
+
+
+class StratificationResponse(BaseModel):
+    """Response body returned by GET /stratification."""
+
+    surface_temp_c: float = Field(description="Most recent surface (0m) water temperature (°C).")
+    deep_temp_c: float = Field(description="Most recent deep (20m) water temperature (°C).")
+    thermocline_strength_c: float = Field(
+        description=(
+            "Temperature difference between surface and 20m (°C). "
+            "Values > 4 °C indicate a well-established thermocline. "
+            "Drives mixing energy, dissolved oxygen distribution, and HAB risk."
+        )
+    )
+    stratification_status: str = Field(
+        description="One of 'stratified', 'weakly_stratified', or 'mixed'."
+    )
+    timestamp: str = Field(description="Timestamp of the most recent reading used.")
+
+
+class BuoyStatusResponse(BaseModel):
+    """Response body returned by GET /buoy-status."""
+
+    ssec_status_code: Optional[int]
+    ssec_status_message: str
+    ssec_last_updated: str
+    pipeline_mode: str = Field(
+        description="'live' if buoy is online and transmitting; 'emulator' otherwise."
+    )
+    ssec_api_reachable: bool
 
 
 # ---------------------------------------------------------------------------
@@ -711,3 +744,135 @@ def get_readings(
     ]
 
     return ReadingsResponse(count=len(readings), readings=readings)
+
+
+# ---------------------------------------------------------------------------
+# GET /stratification
+# ---------------------------------------------------------------------------
+
+SSEC_STATUS_URL: str = "http://metobs.ssec.wisc.edu/api/status/mendota/buoy.json"
+
+
+@app.get("/stratification", response_model=StratificationResponse)
+def get_stratification(db: Session = Depends(get_db)) -> StratificationResponse:
+    """
+    Compute the current thermal stratification strength of Lake Mendota.
+
+    Thermocline strength is defined as the temperature difference between the
+    surface (0m epilimnion) and the deep layer (20m hypolimnion):
+
+        Δt = water_temp_0m − water_temp_20m
+
+    This is the primary metric used by the UW-Madison Center for Limnology
+    to characterise mixing dynamics and harmful algal bloom (HAB) risk:
+
+    - Δt > 10 °C  → strongly stratified; epilimnion thermally isolated;
+                    HAB conditions elevated (warm, nutrient-rich surface).
+    - 4 ≤ Δt ≤ 10 → weakly stratified; some mixing still occurring.
+    - Δt < 4 °C   → mixed; full water column turning over; lower HAB risk.
+
+    Why this matters for autonomous systems: a mission planner routing a
+    subsurface glider or ASV must know whether the water column is stratified
+    to predict dissolved oxygen distributions and safe operating depths.
+
+    Parameters
+    ----------
+    db:
+        Injected SQLAlchemy session.
+
+    Returns
+    -------
+    StratificationResponse
+        Surface temp, deep temp, Δt, and stratification status label.
+
+    Raises
+    ------
+    HTTPException(422)
+        When no clean records are available.
+    """
+    latest = (
+        db.query(BuoyReading)
+        .filter(BuoyReading.is_outlier == False)  # noqa: E712
+        .order_by(BuoyReading.id.desc())
+        .first()
+    )
+
+    if latest is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "No clean records available.  Stream sensor data first, "
+                "then query /stratification."
+            ),
+        )
+
+    delta: float = latest.water_temp_0m - latest.water_temp_20m
+
+    if delta >= 10.0:
+        status = "stratified"
+    elif delta >= 4.0:
+        status = "weakly_stratified"
+    else:
+        status = "mixed"
+
+    logger.info(
+        "Stratification: 0m=%.2f°C  20m=%.2f°C  Δt=%.2f°C  status=%s",
+        latest.water_temp_0m,
+        latest.water_temp_20m,
+        delta,
+        status,
+    )
+
+    return StratificationResponse(
+        surface_temp_c=round(latest.water_temp_0m, 3),
+        deep_temp_c=round(latest.water_temp_20m, 3),
+        thermocline_strength_c=round(delta, 3),
+        stratification_status=status,
+        timestamp=latest.timestamp,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /buoy-status
+# ---------------------------------------------------------------------------
+
+@app.get("/buoy-status", response_model=BuoyStatusResponse)
+def get_buoy_status() -> BuoyStatusResponse:
+    """
+    Proxy the real SSEC MetObs buoy operational status.
+
+    Fetches live status from the UW-Madison Space Science and Engineering
+    Center (SSEC) API at metobs.ssec.wisc.edu and returns whether the
+    physical buoy is currently deployed and transmitting.
+
+    When status_code == 0 the buoy is online and scripts/fetch_ssec.py
+    --live can replace the synthetic emulator with real hardware telemetry.
+    Any other status_code means the buoy is off-station; use the emulator.
+
+    Returns
+    -------
+    BuoyStatusResponse
+        SSEC status fields plus a human-readable pipeline_mode label.
+    """
+    try:
+        resp = http_requests.get(SSEC_STATUS_URL, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+
+        is_online: bool = data.get("status_code", -1) == 0
+        return BuoyStatusResponse(
+            ssec_status_code=data.get("status_code"),
+            ssec_status_message=data.get("status_message", "unknown"),
+            ssec_last_updated=data.get("last_updated", "unknown"),
+            pipeline_mode="live" if is_online else "emulator",
+            ssec_api_reachable=True,
+        )
+    except Exception as exc:
+        logger.warning("Could not reach SSEC status API: %s", exc)
+        return BuoyStatusResponse(
+            ssec_status_code=None,
+            ssec_status_message="SSEC API unreachable",
+            ssec_last_updated="unknown",
+            pipeline_mode="emulator",
+            ssec_api_reachable=False,
+        )
