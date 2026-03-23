@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: sentinel-stream-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./weather_data.db:/app/weather_data.db
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - sentinel-net
+
+  sensor:
+    build: .
+    container_name: sentinel-stream-sensor
+    depends_on:
+      api:
+        condition: service_healthy
+    command: python sensor_emulator.py
+    environment:
+      - API_URL=http://api:8000
+      - PYTHONUNBUFFERED=1
+    restart: on-failure
+    networks:
+      - sentinel-net
+
+networks:
+  sentinel-net:
+    driver: bridge
