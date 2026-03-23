@@ -71,11 +71,11 @@ docker-compose up --build
 
 Each packet passes through 5 steps:
 
-1. **Pydantic validation** — rejects physically impossible values (negative wind, coordinates outside Lake Mendota bounding box, etc.)
-2. **Outlier detection** — flags `is_outlier=True` if `wind_speed_ms > 20.0` or `chlorophyll_ugl > 100.0`
-3. **Rolling buffer** — only clean readings enter the 10-point `deque`. Outliers are stored but never corrupt the smoothing state.
-4. **Smoothed wind** — `mean(rolling_buffer)`, falls back to raw on cold start
-5. **Persistence** — all fields written to SQLite including raw wind, smoothed wind, 4 depth temperatures, chlorophyll, and outlier flag
+1. **Pydantic validation**: rejects physically impossible values (negative wind, coordinates outside Lake Mendota bounding box, etc.)
+2. **Outlier detection**: flags `is_outlier=True` if `wind_speed_ms > 20.0` or `chlorophyll_ugl > 100.0`
+3. **Rolling buffer**: only clean readings enter the 10-point `deque`. Outliers are stored but never corrupt the smoothing state.
+4. **Smoothed wind**: `mean(rolling_buffer)`, falls back to raw on cold start
+5. **Persistence**: all fields written to SQLite including raw wind, smoothed wind, 4 depth temperatures, chlorophyll, and outlier flag
 
 ### Forecast
 
