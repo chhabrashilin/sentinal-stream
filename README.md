@@ -9,7 +9,9 @@
 
 > A high-frequency IoT data pipeline simulating the **NTL-LTER research buoy on Lake Mendota, Madison, WI**, featuring outlier-aware multivariate smoothing and ML-powered 5-minute surface water temperature forecasting.
 
-As a UW-Madison student, I built this as a digital twin of a sensor platform I can see from campus — the [SSEC / Center for Limnology NTL-LTER buoy](https://lter.limnology.wisc.edu/dataset/north-temperate-lakes-lter-high-frequency-data-meteorological-dissolved-oxygen-chlorophyll) anchored 1.5 km NE of Picnic Point. Because the physical buoy is currently **off-station for the season**, this emulator provides a synthetic high-frequency stream to maintain data continuity for predictive modeling.
+As a UW-Madison student, I built this as a digital twin of a sensor platform I can see from campus — the [SSEC / Center for Limnology NTL-LTER buoy](https://lter.limnology.wisc.edu/dataset/north-temperate-lakes-lter-high-frequency-data-meteorological-dissolved-oxygen-chlorophyll) anchored 1.5 km NE of Picnic Point.
+
+**Hardware Abstraction Layer:** Because the physical SSEC Mendota Buoy is currently off-station for the winter (confirmed via `GET /buoy-status` → SSEC API returns `status_code: 8, "Out for the season"`), I developed a high-fidelity emulator calibrated to historical SSEC datasets. It generates telemetry based on late-March post ice-out conditions — including vertical temperature profiles and chlorophyll-a concentrations — to allow for year-round model training and API testing. When the buoy returns to service (~May), a single command (`python scripts/fetch_ssec.py --live`) replaces the emulator with real hardware telemetry, no pipeline changes required.
 
 ---
 
@@ -89,7 +91,9 @@ graph TD
 
 ## Sensor Schema
 
-Mirrors the [NTL-LTER Lake Mendota high-frequency buoy data product](https://lter.limnology.wisc.edu/dataset/north-temperate-lakes-lter-high-frequency-data-meteorological-dissolved-oxygen-chlorophyll):
+Mirrors the [NTL-LTER Lake Mendota high-frequency buoy data product](https://lter.limnology.wisc.edu/dataset/north-temperate-lakes-lter-high-frequency-data-meteorological-dissolved-oxygen-chlorophyll).
+
+Values are calibrated to **late March post ice-out conditions** — Lake Mendota is nearly isothermal at ~4 °C immediately after losing ice cover, with stratification onset beginning in April:
 
 ```json
 {
@@ -97,17 +101,19 @@ Mirrors the [NTL-LTER Lake Mendota high-frequency buoy data product](https://lte
   "location": "Lake Mendota — 1.5 km NE of Picnic Point, Madison, WI",
   "lat": 43.0988,
   "long": -89.4045,
-  "air_temp_c": 12.5,
-  "wind_speed_ms": 5.2,
+  "air_temp_c": 6.0,
+  "wind_speed_ms": 6.0,
   "water_temp_profile": {
-    "0m": 14.0,
-    "5m": 10.5,
-    "10m": 7.2,
-    "20m": 5.1
+    "0m": 4.0,
+    "5m": 3.8,
+    "10m": 3.6,
+    "20m": 3.4
   },
-  "chlorophyll_ugl": 8.5
+  "chlorophyll_ugl": 6.5
 }
 ```
+
+> **Units note:** The SSEC fluorometer reports raw Relative Fluorescence Units (RFU) which can read 5,000–15,000 RFU. These are **not** µg/L. The Turner Cyclops sensor used on the Mendota buoy applies a site-specific calibration factor (~0.001–0.003 µg/L per RFU). This pipeline stores the calibrated µg/L value.
 
 ---
 

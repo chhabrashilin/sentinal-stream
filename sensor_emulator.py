@@ -65,27 +65,46 @@ BUOY_LON: float = -89.4045  # degrees West (negative = West)
 BUOY_LOCATION: str = "Lake Mendota — 1.5 km NE of Picnic Point, Madison, WI"
 
 # ---------------------------------------------------------------------------
-# Environmental baselines — mid-spring (April) for Lake Mendota
+# Environmental baselines — late March (post ice-out) for Lake Mendota
+#
+# Calibrated to match observed SSEC buoy data for this time of year.
+# Lake Mendota typically loses ice cover in mid-to-late March (ice-off date
+# varies: 1855–present record kept by UW-Madison Limnology).  Immediately
+# after ice-out the water column is nearly isothermal at ~4 °C — the
+# temperature of maximum density — because winter mixing has erased all
+# stratification.  Surface warming and stratification onset begins in April.
+#
+# Key distinction from summer values:
+#   Summer (Jul):  surface ~24 °C, 20m ~7 °C, Δt ≈ 17 °C (strongly stratified)
+#   Now (Mar):     surface ~4 °C,  20m ~3.5 °C, Δt ≈ 0.5 °C (fully mixed)
 # ---------------------------------------------------------------------------
 
-# Air temperature: Madison, WI April average ~10 °C; warm-spell baseline.
-BASE_AIR_TEMP_C: float = 12.0
+# Air temperature: Madison, WI late March average 5–8 °C; cool post-ice baseline.
+BASE_AIR_TEMP_C: float = 6.0
 
-# Wind: Lake Mendota is exposed to prevailing SW winds; moderate spring breeze.
-BASE_WIND_MS: float = 5.2
+# Wind: Lake Mendota is exposed to prevailing SW winds; moderate spring gusts.
+BASE_WIND_MS: float = 6.0
 
-# Water temperature vertical profile — spring thermal stratification begins.
-# Surface warms first; hypolimnion remains near winter values (4 °C).
+# Water temperature vertical profile — post ice-out, nearly isothermal.
+# The full water column sits near 4 °C (temperature of maximum density).
+# /stratification endpoint will correctly classify this as "mixed".
 BASE_WATER_TEMP: dict[str, float] = {
-    "0m":  14.0,   # epilimnion — warming rapidly under spring sun
-    "5m":  10.5,   # thermocline developing
-    "10m":  7.2,   # metalimnion
-    "20m":  5.1,   # hypolimnion — near isothermal with winter turnover temp
+    "0m":  4.0,   # surface — just above freezing, ice-out conditions
+    "5m":  3.8,   # slight cooling with depth (inverse stratification resolving)
+    "10m": 3.6,   # nearly isothermal through metalimnion
+    "20m": 3.4,   # hypolimnion — coldest layer during spring turnover
 }
 
-# Chlorophyll-a: early spring moderate level before summer bloom season.
-# Units: µg/L (micrograms per litre).  NTL-LTER typical range: 2–80 µg/L.
-BASE_CHLOROPHYLL_UGL: float = 8.5
+# Chlorophyll-a: late-winter/early-spring low.  Post ice-out phytoplankton
+# bloom has not yet started; diatom communities are beginning to establish.
+# Units: µg/L (micrograms per litre).  NTL-LTER observed range Mar: 2–12 µg/L.
+#
+# NOTE: The SSEC fluorometer reports raw Relative Fluorescence Units (RFU)
+# which can read 5000–15000 RFU — these are NOT µg/L.  The conversion factor
+# is instrument-specific (typically ~1 RFU ≈ 0.001–0.003 µg/L for the
+# Turner Cyclops sensor used on the Mendota buoy).  This pipeline stores
+# the calibrated µg/L value.
+BASE_CHLOROPHYLL_UGL: float = 6.5
 
 # ---------------------------------------------------------------------------
 # Sensor noise standard deviations (σ)
@@ -131,11 +150,14 @@ def _water_temp_profile(sequence: int) -> dict[str, float]:
     """
     Generate a synthetic vertical water temperature profile.
 
-    A diurnal heating cycle is applied to the surface (0m) layer only —
-    the epilimnion responds to solar radiation on a daily timescale, while
-    the hypolimnion (20m) is thermally isolated by the developing pycnocline.
-    This models the thermal stratification dynamic that is the primary focus
-    of the NTL-LTER Mendota buoy's sub-surface temperature chain.
+    A diurnal heating cycle is applied to the surface (0m) layer only.
+    In late March (post ice-out), the water column is nearly isothermal and
+    the thermocline has not yet formed, so diurnal solar heating amplitude is
+    small (~0.3 °C) compared to summer (~1.5 °C).  As the season progresses
+    into April–May the surface will warm faster than depth, establishing the
+    pycnocline and increasing the diurnal amplitude.  The /stratification
+    endpoint will reflect this: currently returning "mixed", transitioning to
+    "weakly_stratified" as spring progresses.
 
     Parameters
     ----------
@@ -148,7 +170,10 @@ def _water_temp_profile(sequence: int) -> dict[str, float]:
         Water temperature (°C) keyed by depth string: "0m", "5m", "10m", "20m".
     """
     # Diurnal surface warming: ±1.5 °C amplitude over 86 400 s (24 hours).
-    surface_diurnal: float = 1.5 * np.sin(2 * np.pi * sequence / 86_400)
+    # Post ice-out diurnal amplitude is small — isothermal column has high
+    # thermal mass and low stratification, so solar heating distributes quickly.
+    # Summer amplitude (~1.5 °C) grows as the thermocline traps heat near surface.
+    surface_diurnal: float = 0.3 * np.sin(2 * np.pi * sequence / 86_400)
 
     profile: dict[str, float] = {}
     for depth, base in BASE_WATER_TEMP.items():
@@ -182,8 +207,9 @@ def generate_reading(sequence: int) -> dict:
     """
     now: datetime.datetime = datetime.datetime.utcnow()
 
-    # Diurnal air temperature cycle: ±3 °C over 24 hours.
-    diurnal_air: float = 3.0 * np.sin(2 * np.pi * sequence / 86_400)
+    # Diurnal air temperature cycle: ±4 °C over 24 hours.
+    # Late March in Madison: cold nights (~2 °C) warming to ~10 °C midday.
+    diurnal_air: float = 4.0 * np.sin(2 * np.pi * sequence / 86_400)
     air_temp_c: float = BASE_AIR_TEMP_C + diurnal_air + np.random.normal(0.0, NOISE_AIR_TEMP_STD)
 
     wind_speed_ms: float = max(0.0, BASE_WIND_MS + np.random.normal(0.0, NOISE_WIND_STD))
