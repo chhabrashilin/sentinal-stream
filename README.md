@@ -2,7 +2,7 @@
 
 Demo recording: https://youtu.be/jjXKpOC2HC8
 
-![Alt text](../Sentinel Stream Screenshot.png)
+![Sentinel Stream Demo Screenshot](./Sentinel Stream Screenshot.png)
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688?logo=fastapi&logoColor=white)
