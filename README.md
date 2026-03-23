@@ -1,36 +1,43 @@
-# Sentinel-Stream
-### Real-Time Maritime Environmental Intelligence Pipeline
+# Sentinel-Stream: Mendota Edition
+### Real-Time Lake Environmental Intelligence Pipeline
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688?logo=fastapi&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-17%20passing-brightgreen)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-> A high-frequency IoT data pipeline simulating an autonomous maritime buoy at the Port of Long Beach, featuring real-time noise filtering and ML-powered 5-minute weather forecasting.
+> A high-frequency IoT data pipeline simulating the **NTL-LTER research buoy on Lake Mendota, Madison, WI**, featuring outlier-aware multivariate smoothing and ML-powered 5-minute surface water temperature forecasting.
+
+As a UW-Madison student, I built this as a digital twin of a sensor platform I can see from campus — the [SSEC / Center for Limnology NTL-LTER buoy](https://lter.limnology.wisc.edu/dataset/north-temperate-lakes-lter-high-frequency-data-meteorological-dissolved-oxygen-chlorophyll) anchored 1.5 km NE of Picnic Point. Because the physical buoy is currently **off-station for the season**, this emulator provides a synthetic high-frequency stream to maintain data continuity for predictive modeling.
 
 ---
 
 ## Why This Project
 
-Autonomous surface vessels (ASVs) live or die on the quality of their environmental situational awareness. A vessel routing algorithm that acts on raw, noisy sensor data risks making sub-optimal or unsafe decisions — a miscalibrated anemometer reporting 60 m/s winds during a 10 m/s coastal breeze could abort a mission unnecessarily.
+Autonomous vehicles — whether surface vessels, underwater gliders, or aerial drones — live or die on the quality of their environmental situational awareness. A routing algorithm acting on raw, noisy sensor data risks unsafe decisions. A miscalibrated anemometer reporting 25 m/s winds during a 5 m/s breeze could abort a mission unnecessarily; a fouled fluorometer falsely signalling a harmful algal bloom (HAB) could trigger an incorrect no-sail zone.
 
-Sentinel-Stream tackles this exact problem: a buoy emulator generates 1 Hz telemetry with realistic Gaussian noise, intermittent packet loss, and occasional anemometer-saturation spikes. The pipeline ingests, validates, filters, and stores these readings — then serves ML-powered 5-minute temperature forecasts to operators and autonomous decision systems.
+Sentinel-Stream tackles this exact problem at the data layer:
 
-This mirrors the data-layer challenges Mantari faces in enabling autonomous maritime operations: reliable sensor fusion, real-time noise filtering, and actionable environmental intelligence for vessels that cannot rely on a human in the loop.
+- The **emulator** generates 1 Hz multivariate telemetry with realistic Gaussian noise, 10% packet loss, and 5% outlier injection across both wind and chlorophyll channels.
+- The **ingest pipeline** validates, filters, and stores every packet — outliers are quarantined from the smoothing buffer but preserved in full for post-incident forensic analysis.
+- The **forecast endpoint** produces 5-minute surface water temperature predictions from a real-time linear regression, with an R² confidence score the calling system can use to decide whether to trust the prediction.
+
+This mirrors the data-layer challenges that autonomous environmental intelligence systems face: reliable sensor fusion, real-time noise filtering, and actionable situational awareness for systems that cannot rely on a human in the loop.
 
 ---
 
 ## Features
 
-- **1 Hz sensor emulation** — diurnal temperature cycle, Gaussian noise, and three configurable fault modes
-- **Chaos engineering baked in** — 10 % packet drop, 5 % outlier injection, configurable via environment variables
-- **Outlier-aware rolling average** — 10-point window that quarantines bad readings rather than letting them corrupt 10 subsequent smoothed values
-- **ML temperature forecasting** — scikit-learn linear regression predicts temperature 5 minutes ahead with R² confidence score
-- **Trend classification** — `rising`, `falling`, or `stable` with a 0.1 °C dead-band to prevent noise-driven label flipping
-- **Full audit trail** — raw and smoothed values stored side-by-side; outlier flag preserved for post-incident forensic analysis
-- **Docker Compose ready** — single command brings up API + sensor emulator with health-gated service dependency
-- **Pydantic validation** — physical-plausibility constraints on every field; malformed packets rejected before touching the DB
-- **Pytest suite** — 12 tests covering ingest, smoothing math, validation, forecasting, and status; isolated in-memory DB per test
+- **1 Hz multivariate emulation** — atmospheric (air temp, wind) + sub-surface temperature vertical profile (0m, 5m, 10m, 20m) + chlorophyll-a concentration
+- **Thermal stratification modelling** — diurnal surface heating applied with depth-dependent attenuation, replicating Lake Mendota's spring epilimnion dynamics
+- **Dual-channel outlier detection** — wind outliers (>20 m/s, inland lake threshold) AND chlorophyll outliers (>100 µg/L, fluorometer fouling threshold) — either triggers quarantine
+- **Outlier-aware rolling average** — 10-point window exclusively over clean wind readings; outlier packets never corrupt subsequent smoothed values
+- **ML surface temperature forecasting** — scikit-learn Linear Regression predicts 0m water temperature 5 minutes ahead, with R² confidence score and rising/falling/stable trend
+- **Full audit trail** — raw and smoothed values, all depth temperatures, chlorophyll, and outlier flag stored side-by-side
+- **Lat/lon physical validation** — coordinates validated to the Lake Mendota bounding box; GPS spoofing or unit errors (e.g., degrees vs. radians) rejected at the boundary
+- **Docker Compose ready** — single command brings up API + sensor emulator with health-gated startup
+- **17-test pytest suite** — in-memory isolated DB per test, covering both outlier fault paths, smoothing math, forecast structure, and all validation constraints
 
 ---
 
@@ -38,14 +45,14 @@ This mirrors the data-layer challenges Mantari faces in enabling autonomous mari
 
 | Layer | Technology | Rationale |
 |---|---|---|
-| API framework | FastAPI 0.111 | Async-capable, auto-generated OpenAPI docs, native Pydantic integration |
-| Data validation | Pydantic v2 | Compile-time schema enforcement with field-level physical constraints |
-| ORM / persistence | SQLAlchemy 2.0 + SQLite | Zero-config edge storage; same API contract supports TimescaleDB swap-in |
-| ML forecasting | scikit-learn LinearRegression | Interpretable, low-compute, edge-deployable |
-| Data wrangling | pandas + NumPy | Rolling window operations and regression feature engineering |
-| Sensor emulation | Python + NumPy | Gaussian noise, diurnal cycles, controlled fault injection |
+| API framework | FastAPI 0.111 | Async-capable, auto-generated OpenAPI docs, native Pydantic v2 integration |
+| Data validation | Pydantic v2 | Field-level physical plausibility constraints; nested schema for depth profile |
+| ORM / persistence | SQLAlchemy 2.0 + SQLite | Zero-config edge storage; depth columns enable direct SQL aggregation on stratification data |
+| ML forecasting | scikit-learn LinearRegression | Interpretable slope coefficient; fits in <1 ms on edge hardware |
+| Data wrangling | pandas + NumPy | Relative-time feature engineering; Gaussian noise generation |
+| Sensor emulation | Python + NumPy | Diurnal cycles with depth-attenuated heating, controlled dual-channel fault injection |
 | Containerisation | Docker + Compose | Reproducible environment; health-gated multi-service startup |
-| Testing | pytest + httpx | Dependency-injected in-memory DB; no production state pollution |
+| Testing | pytest + httpx + StaticPool | Per-test in-memory DB isolation; no production state pollution |
 
 ---
 
@@ -53,29 +60,53 @@ This mirrors the data-layer challenges Mantari faces in enabling autonomous mari
 
 ```mermaid
 graph TD
-    subgraph "Edge Layer — Maritime Sensor Buoy"
-        A["🛰️ Sensor Emulator\n(sensor_emulator.py)"] -->|1Hz JSON Stream| B{"Chaos Engine"}
-        B -->|Gaussian Noise + Outliers| C[HTTP POST /ingest]
+    subgraph "Edge Layer — Lake Mendota Buoy (43.0988°N, 89.4045°W)"
+        A["🛰️ NTL-LTER Emulator\n(sensor_emulator.py)"] -->|1Hz JSON Stream| B{"Chaos Engine"}
+        B -->|Gaussian Noise + Dual Outliers| C[HTTP POST /ingest]
         B -->|10% Packet Drop| D[💀 Dropped Packet]
     end
 
     subgraph "Processing Layer — FastAPI Microservice"
-        C --> E[Pydantic Validation]
-        E --> F[Outlier Detection\nwind > 30 m/s flagged]
-        F --> G[10-Point Rolling\nWindow Buffer]
-        G --> H[Smoothing Algorithm\nfilters sea spray noise]
+        C --> E[Pydantic Validation\nLat/lon bounds · Physical ranges]
+        E --> F[Outlier Detection\nwind > 20 m/s OR chl > 100 µg/L]
+        F --> G[10-Point Rolling Window\nclean wind readings only]
+        G --> H[Smoothing Algorithm\nfilters anemometer noise]
     end
 
     subgraph "Persistence & Intelligence"
-        H --> I[(SQLite Database\nweather_data.db)]
+        H --> I[(SQLite Database\nmendota_buoy.db)]
         I --> J[GET /forecast]
-        J --> K[Scikit-Learn\nLinear Regression]
-        K --> L["📈 5-Min Temp Prediction\n+ Trend + R² Score"]
+        J --> K[Scikit-Learn\nLinear Regression on 0m temp]
+        K --> L["📈 5-Min Surface Temp Prediction\n+ Trend + R² Score"]
     end
 
-    style A fill:#f96,stroke:#333,color:#000
-    style I fill:#69f,stroke:#333,color:#000
+    style A fill:#c8102e,stroke:#333,color:#fff
+    style I fill:#0479a8,stroke:#333,color:#fff
     style L fill:#9f6,stroke:#333,color:#000
+```
+
+---
+
+## Sensor Schema
+
+Mirrors the [NTL-LTER Lake Mendota high-frequency buoy data product](https://lter.limnology.wisc.edu/dataset/north-temperate-lakes-lter-high-frequency-data-meteorological-dissolved-oxygen-chlorophyll):
+
+```json
+{
+  "timestamp": "2026-03-22T20:27:00Z",
+  "location": "Lake Mendota — 1.5 km NE of Picnic Point, Madison, WI",
+  "lat": 43.0988,
+  "long": -89.4045,
+  "air_temp_c": 12.5,
+  "wind_speed_ms": 5.2,
+  "water_temp_profile": {
+    "0m": 14.0,
+    "5m": 10.5,
+    "10m": 7.2,
+    "20m": 5.1
+  },
+  "chlorophyll_ugl": 8.5
+}
 ```
 
 ---
@@ -83,32 +114,17 @@ graph TD
 ## Quick Start — Local
 
 ```bash
-# 1. Clone and install dependencies
-git clone https://github.com/your-username/sentinel-stream.git
-cd sentinel-stream
+# 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Start the API server
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+# 2. Start the API (terminal 1)
+uvicorn main:app --reload
 
-# 3. In a second terminal, start the sensor emulator
+# 3. Start the sensor emulator (terminal 2)
 python sensor_emulator.py
 
-# 4. Explore the live API docs
+# 4. View live API docs
 open http://localhost:8000/docs
-```
-
-Key endpoints while running:
-
-```bash
-# Check system health
-curl http://localhost:8000/status
-
-# Get a 5-minute temperature forecast (after ~10 seconds of data)
-curl http://localhost:8000/forecast
-
-# View the last 5 readings
-curl "http://localhost:8000/readings?n=5"
 ```
 
 ---
@@ -116,18 +132,11 @@ curl "http://localhost:8000/readings?n=5"
 ## Quick Start — Docker
 
 ```bash
-# Build images and start both services (API + sensor emulator)
+# Build and launch both services with a single command
 docker-compose up --build
 
-# The sensor emulator waits for the API healthcheck to pass before starting.
-# Watch logs from both containers:
-docker-compose logs -f
-
-# Tear down
-docker-compose down
+# The sensor begins streaming automatically once the API passes its health check
 ```
-
-The `weather_data.db` file is volume-mounted so data persists across container restarts.
 
 ---
 
@@ -135,59 +144,40 @@ The `weather_data.db` file is volume-mounted so data persists across container r
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/ingest` | Accept a sensor reading; validate, detect outliers, smooth, persist |
-| `GET` | `/forecast` | 5-minute temperature forecast via linear regression (min 10 records) |
-| `GET` | `/status` | Health probe: record count + latest reading snapshot |
-| `GET` | `/readings` | Last N readings (default 20, max 1000) — `?n=50` |
+| `POST` | `/ingest` | Ingest a validated buoy telemetry packet; returns smoothed wind and outlier flag |
+| `GET` | `/forecast` | 5-minute surface water temperature forecast (requires ≥10 clean records) |
+| `GET` | `/status` | System health probe — Docker healthcheck target |
+| `GET` | `/readings?n=20` | Retrieve the N most recent buoy records |
+| `GET` | `/docs` | Auto-generated interactive OpenAPI documentation |
 
-### POST /ingest — Request body
+---
 
-```json
-{
-  "timestamp": "2024-06-01T12:00:00Z",
-  "lat": 33.7541,
-  "long": -118.2130,
-  "temp_c": 18.5,
-  "pressure_hpa": 1013.25,
-  "wind_ms": 5.2
-}
-```
+## Chaos Engineering
 
-### POST /ingest — Response
+Three fault modes are injected by the emulator to exercise pipeline resilience:
 
-```json
-{
-  "status": "ok",
-  "smoothed_wind": 5.18,
-  "is_outlier": false
-}
-```
-
-### GET /forecast — Response
-
-```json
-{
-  "current_temp": 18.52,
-  "forecast_5min_temp": 18.74,
-  "trend": "rising",
-  "r_squared": 0.983,
-  "records_used": 100
-}
-```
-
-Full interactive docs available at `http://localhost:8000/docs` (Swagger UI) and `http://localhost:8000/redoc`.
+| Mode | Rate | Simulates | Pipeline Response |
+|---|---|---|---|
+| Gaussian noise | Every packet | Thermistor / anemometer / fluorometer measurement error | Rolling average absorbs noise |
+| Packet drop | 10% | LoRaWAN RF packet loss through vegetation and terrain | API is stateless per-request; gaps cause no corruption |
+| Wind outlier | ~2.5% | Anemometer saturation from spray or mechanical fault | Flagged `is_outlier=True`, excluded from rolling buffer |
+| Chlorophyll outlier | ~2.5% | Fluorometer lens fouling from seasonal biofilm | Flagged `is_outlier=True`, excluded from forecast regression |
 
 ---
 
 ## Design Decisions
 
-### Linear Regression for Forecasting
+**Why Linear Regression for `/forecast`?**
+In edge-compute environments — a shore-station Raspberry Pi or the processing unit on an autonomous surface vessel — compute budget matters. Linear regression fits the last 100 records in under 1 ms, returning an interpretable slope coefficient (°C/s surface warming rate) that operators and autonomous systems can sanity-check against known seasonal dynamics. The R² score provides a built-in confidence signal: if R² < 0.5, the caller should widen its uncertainty bounds.
 
-A neural network or ARIMA model would produce better accuracy on longer horizons — but neither is appropriate here. The target deployment context is a resource-constrained edge processor (think: buoy-side Raspberry Pi or Jetson Nano) where millisecond inference latency and a tiny memory footprint are mandatory. Linear regression fits in under 1 ms, requires no GPU, and produces a directly interpretable slope coefficient that operators can reason about without a data science background. For a 5-minute horizon with a diurnal temperature signal, R² values above 0.90 are routinely achievable — sufficient for weather-routing decisions.
+**Why SQLite?**
+Zero configuration, no daemon, single-file portability. This mirrors how environmental data is typically stored locally on buoy electronics or shore-station edge computers before being batch-synced to a central archive (e.g., the UW-Madison SSEC data servers). The same API contract supports a TimescaleDB or InfluxDB swap-in for a multi-buoy fleet deployment.
 
-### SQLite for Edge Storage
+**Why store outliers rather than discard them?**
+Outliers are quarantined from the rolling buffer and regression (to protect analytics), but stored in full with `is_outlier=True`. This enables post-incident forensic analysis — for example, correlating a false HAB alert with a fluorometer fouling event — without resorting to log files.
 
-A managed database (PostgreSQL, TimescaleDB) would offer better concurrent write throughput and time-series query optimisation. SQLite was chosen deliberately to match the zero-configuration, single-binary deployment model of an edge maritime station: no separate DB daemon, no network dependency, single-file backup via `scp`, and crash-safe WAL journaling out of the box. The FastAPI abstraction layer (SQLAlchemy ORM + `get_db` dependency) means swapping in TimescaleDB requires changing exactly one line — the `DATABASE_URL` string — with no changes to endpoint logic.
+**Why separate DB columns for each depth?**
+Storing `water_temp_0m`, `water_temp_5m`, `water_temp_10m`, `water_temp_20m` as individual Float columns (rather than a JSON blob) allows direct SQL aggregation on stratification metrics — e.g., thermocline strength = `water_temp_0m - water_temp_20m` — without full-row deserialization.
 
 ---
 
@@ -197,39 +187,29 @@ A managed database (PostgreSQL, TimescaleDB) would offer better concurrent write
 # Run the full test suite
 pytest tests/ -v
 
-# Run with coverage report
-pytest tests/ -v --tb=short
+# 17 tests — all passing
 ```
 
-The test suite uses FastAPI's `TestClient` (backed by `httpx`) and overrides the `get_db` dependency to inject a fresh in-memory SQLite database for every test. The in-process rolling-window buffer is also cleared between tests. This means:
-
-- No `weather_data.db` file is created or modified during testing
-- Tests are fully isolated — execution order does not matter
-- The suite runs in under 5 seconds on any modern laptop
-
----
-
-## Chaos Engineering
-
-Three fault modes are implemented in `sensor_emulator.py` to validate pipeline robustness. All are configurable via environment variables:
-
-| Fault | Default Rate | Env Variable | Maritime Rationale |
-|---|---|---|---|
-| Packet drop | 10 % | `PACKET_DROP_RATE` | VHF/UHF radio links in congested harbour RF environments drop 10–20 % of packets; the API must tolerate gaps without corrupting time-series state |
-| Outlier injection | 5 % | `OUTLIER_RATE` | Sea spray and nearby lightning can saturate anemometer cups, sending spurious readings >50 m/s; the smoothing layer must quarantine these without discarding valid high-wind events |
-| Gaussian noise | Always on | _(fixed σ values)_ | Every physical sensor has normally-distributed measurement error; ignoring this produces misleading downstream analytics and false-alarm spikes in alert systems |
-
-```bash
-# Example: increase outlier rate to 20% for stress testing
-OUTLIER_RATE=0.20 python sensor_emulator.py
-```
+Tests cover:
+- Valid multivariate packet ingestion
+- Wind outlier detection (>20 m/s)
+- Chlorophyll outlier detection (>100 µg/L)
+- Rolling average arithmetic correctness
+- Outlier exclusion from rolling buffer
+- Surface water temperature echoed in response
+- Forecast 422 on insufficient data
+- Forecast rising-trend correctness
+- Status health probe
+- Record count increment
+- Pydantic validation: missing field, lat out-of-range, negative wind, negative chlorophyll, empty body
+- Readings endpoint: empty DB and depth profile structure
 
 ---
 
-## License
+## Data Reference
 
-MIT — see [LICENSE](LICENSE).
+This project is modelled on publicly available NTL-LTER data from the UW-Madison Center for Limnology:
 
----
-
-*Built as a portfolio project demonstrating IoT data pipeline engineering, real-time stream processing, and ML-powered environmental intelligence for maritime autonomy applications.*
+- **Buoy dataset**: [NTL-LTER High-Frequency Meteorological, Dissolved Oxygen, and Chlorophyll Data](https://lter.limnology.wisc.edu/dataset/north-temperate-lakes-lter-high-frequency-data-meteorological-dissolved-oxygen-chlorophyll)
+- **Operator**: UW-Madison Space Science and Engineering Center (SSEC) + Center for Limnology
+- **Buoy position**: 43.0988° N, 89.4045° W — 1.5 km NE of Picnic Point, Lake Mendota, Madison, WI

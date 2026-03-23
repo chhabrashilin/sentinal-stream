@@ -7,7 +7,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./weather_data.db:/app/weather_data.db
+      - ./mendota_buoy.db:/app/mendota_buoy.db
     environment:
       - PYTHONUNBUFFERED=1
     healthcheck:

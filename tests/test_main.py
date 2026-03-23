@@ -1,16 +1,17 @@
 """
-tests/test_main.py — Sentinel-Stream API Test Suite
+tests/test_main.py — Sentinel-Stream Mendota Edition — API Test Suite
 
-Covers the full request lifecycle: validation, outlier detection,
-rolling-average accuracy, forecast minimum-data guard, and status health.
+Covers the full request lifecycle: multivariate schema validation, outlier
+detection (wind AND chlorophyll paths), rolling-average accuracy, forecast
+minimum-data guard, and status health.
 
 Each test runs against a **fresh in-memory SQLite database** injected via
-FastAPI's dependency-override mechanism.  This ensures complete test
-isolation — no shared state between tests, no leftover records from a
-previous run, and no touching the production `weather_data.db` file.
+FastAPI's dependency-override mechanism.  StaticPool ensures all connections
+share the same in-memory database within a single test — without it, each
+new connection would see an empty schema.
 
-The rolling_buffer deque in main.py is also cleared before each test to
-prevent smoothing state from leaking between test cases.
+The rolling_buffer deque is also cleared before each test to prevent
+smoothing state from leaking between test cases.
 """
 
 from __future__ import annotations
@@ -21,11 +22,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-# Import the app and the objects we need to override / reset.
 from main import (
     Base,
-    SessionLocal,
-    WeatherReading,
+    BuoyReading,
     app,
     get_db,
     rolling_buffer,
@@ -37,10 +36,11 @@ from main import (
 
 def make_test_engine():
     """
-    Create a fresh SQLite in-memory engine and run all DDL migrations.
+    Create a fresh SQLite in-memory engine with all DDL applied.
 
-    Using ``check_same_thread=False`` mirrors the production engine config
-    and is required for SQLite to work with FastAPI's threaded test runner.
+    StaticPool forces all connections to share one underlying connection,
+    so the tables created by Base.metadata.create_all() are visible to
+    every subsequent session — necessary for in-memory SQLite testing.
     """
     test_engine = create_engine(
         "sqlite:///:memory:",
@@ -61,11 +61,10 @@ def client():
     Pytest fixture that yields a FastAPI TestClient backed by a fresh
     in-memory database and a cleared rolling-window buffer.
 
-    The dependency override replaces the production ``get_db`` dependency
-    with one that yields sessions from the ephemeral in-memory engine,
-    so no test writes to ``weather_data.db``.
+    The dependency override replaces the production get_db with one that
+    yields sessions from the ephemeral in-memory engine, so no test
+    writes to mendota_buoy.db.
     """
-    # Each fixture invocation gets its own isolated engine.
     test_engine = make_test_engine()
     TestingSessionLocal = sessionmaker(
         autocommit=False, autoflush=False, bind=test_engine
@@ -76,15 +75,11 @@ def client():
             yield db
 
     app.dependency_overrides[get_db] = override_get_db
-
-    # Clear the in-process rolling buffer so smoothing state from a previous
-    # test cannot influence the current one.
     rolling_buffer.clear()
 
     with TestClient(app, raise_server_exceptions=True) as test_client:
         yield test_client
 
-    # Restore the original dependency after the test completes.
     app.dependency_overrides.clear()
     rolling_buffer.clear()
 
@@ -95,16 +90,23 @@ def client():
 
 def _valid_payload(**overrides) -> dict:
     """
-    Return a minimal valid sensor payload for the Port of Long Beach buoy.
+    Return a minimal valid Lake Mendota buoy payload.
     Any field can be overridden via keyword arguments.
     """
-    base = {
-        "timestamp": "2024-06-01T12:00:00Z",
-        "lat": 33.7541,
-        "long": -118.2130,
-        "temp_c": 18.5,
-        "pressure_hpa": 1013.25,
-        "wind_ms": 5.2,
+    base: dict = {
+        "timestamp": "2026-03-22T20:27:00Z",
+        "location": "Lake Mendota — 1.5 km NE of Picnic Point, Madison, WI",
+        "lat": 43.0988,
+        "long": -89.4045,
+        "air_temp_c": 12.5,
+        "wind_speed_ms": 5.2,
+        "water_temp_profile": {
+            "0m": 14.0,
+            "5m": 10.5,
+            "10m": 7.2,
+            "20m": 5.1,
+        },
+        "chlorophyll_ugl": 8.5,
     }
     base.update(overrides)
     return base
@@ -119,8 +121,8 @@ class TestIngestEndpoint:
 
     def test_ingest_valid_packet(self, client: TestClient) -> None:
         """
-        A well-formed sensor payload should be accepted with HTTP 200 and
-        return a smoothed_wind value in the response body.
+        A well-formed multivariate buoy payload should be accepted with
+        HTTP 200 and return smoothed_wind_ms and surface_water_temp_c.
         """
         response = client.post("/ingest", json=_valid_payload())
 
@@ -128,78 +130,95 @@ class TestIngestEndpoint:
 
         body = response.json()
         assert body["status"] == "ok"
-        assert isinstance(body["smoothed_wind"], float)
+        assert isinstance(body["smoothed_wind_ms"], float)
+        assert isinstance(body["surface_water_temp_c"], float)
         assert body["is_outlier"] is False
 
-    def test_ingest_outlier_flagged(self, client: TestClient) -> None:
+    def test_ingest_wind_outlier_flagged(self, client: TestClient) -> None:
         """
-        A packet with wind_ms = 55.0 m/s exceeds the 30 m/s outlier
-        threshold.  The API should accept it (HTTP 200) but set is_outlier=True
-        so that downstream consumers can filter it from analytics.
+        A packet with wind_speed_ms = 25.0 m/s exceeds the 20 m/s inland
+        lake outlier threshold.  The API must accept it (HTTP 200) but set
+        is_outlier=True so it is excluded from smoothing and analytics.
         """
-        payload = _valid_payload(wind_ms=55.0)
+        payload = _valid_payload(wind_speed_ms=25.0)
         response = client.post("/ingest", json=payload)
 
         assert response.status_code == 200, response.text
+        assert response.json()["is_outlier"] is True
 
-        body = response.json()
-        assert body["is_outlier"] is True, (
-            "Expected is_outlier=True for wind_ms=55.0 m/s"
+    def test_ingest_chlorophyll_outlier_flagged(self, client: TestClient) -> None:
+        """
+        A packet with chlorophyll_ugl = 150.0 exceeds the 100 µg/L threshold
+        for fluorometer fouling.  The API must flag it as an outlier even
+        when wind speed is within bounds — either variable triggers the flag.
+        """
+        payload = _valid_payload(chlorophyll_ugl=150.0)
+        response = client.post("/ingest", json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["is_outlier"] is True, (
+            "Expected is_outlier=True for chlorophyll_ugl=150.0 µg/L"
         )
 
     def test_rolling_average_math(self, client: TestClient) -> None:
         """
-        Send exactly 10 non-outlier packets with known wind_ms values and
-        verify that the smoothed_wind returned on the 10th packet equals
-        the arithmetic mean of all 10 values.
+        Send exactly 10 clean packets with known wind_speed_ms values and
+        verify the smoothed_wind_ms on the 10th packet equals their mean.
 
-        This test pins the core correctness invariant of the smoothing layer:
-        the rolling average must be the mean of the last WINDOW_SIZE clean
-        readings, not a weighted or exponential average.
+        This pins the core correctness invariant of the smoothing layer:
+        a simple arithmetic mean of the last WINDOW_SIZE clean readings.
         """
         wind_values = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
-        expected_average = sum(wind_values) / len(wind_values)  # 5.5
+        expected_avg = sum(wind_values) / len(wind_values)  # 5.5
 
         last_response = None
-        for wind in wind_values:
-            last_response = client.post("/ingest", json=_valid_payload(wind_ms=wind))
+        for w in wind_values:
+            last_response = client.post("/ingest", json=_valid_payload(wind_speed_ms=w))
             assert last_response.status_code == 200
 
         body = last_response.json()
-        assert abs(body["smoothed_wind"] - expected_average) < 1e-6, (
-            f"Expected smoothed_wind={expected_average}, got {body['smoothed_wind']}"
+        assert abs(body["smoothed_wind_ms"] - expected_avg) < 1e-6, (
+            f"Expected smoothed_wind_ms={expected_avg}, got {body['smoothed_wind_ms']}"
         )
 
     def test_outlier_excluded_from_rolling_buffer(self, client: TestClient) -> None:
         """
-        An outlier packet must NOT enter the rolling buffer.  Send 5 clean
-        packets, 1 outlier, then 4 more clean packets.  The smoothed_wind
-        after the final packet should equal the mean of the 9 clean packets
-        (not 10, because the buffer has only 9 clean entries).
+        An outlier packet must NOT enter the rolling buffer.
 
-        This guards the invariant that outliers are quarantined from
-        smoothing state.
+        Send 5 clean packets (wind=4.0), 1 wind outlier (wind=25.0), then
+        4 clean packets (wind=6.0).  The buffer should contain 9 clean values
+        [4,4,4,4,4,6,6,6,6] with mean = (5*4 + 4*6) / 9 ≈ 4.888.
+
+        This guards the invariant that outlier quarantine works across both
+        fault types — a wind outlier must not enter the wind smoothing buffer.
         """
-        # 5 clean packets with wind = 4.0
         for _ in range(5):
-            client.post("/ingest", json=_valid_payload(wind_ms=4.0))
+            client.post("/ingest", json=_valid_payload(wind_speed_ms=4.0))
 
-        # 1 outlier — must NOT enter the buffer
-        client.post("/ingest", json=_valid_payload(wind_ms=60.0))
+        client.post("/ingest", json=_valid_payload(wind_speed_ms=25.0))  # outlier
 
-        # 4 more clean packets with wind = 6.0
         last_response = None
         for _ in range(4):
-            last_response = client.post("/ingest", json=_valid_payload(wind_ms=6.0))
+            last_response = client.post("/ingest", json=_valid_payload(wind_speed_ms=6.0))
 
-        # Buffer should contain [4, 4, 4, 4, 4, 6, 6, 6, 6] — 9 clean values
-        # mean = (5*4 + 4*6) / 9 = (20 + 24) / 9 = 44/9 ≈ 4.888...
-        expected = (5 * 4.0 + 4 * 6.0) / 9
+        expected = (5 * 4.0 + 4 * 6.0) / 9  # ≈ 4.888
         body = last_response.json()
-        assert abs(body["smoothed_wind"] - expected) < 1e-4, (
-            f"Expected {expected:.4f}, got {body['smoothed_wind']}"
+        assert abs(body["smoothed_wind_ms"] - expected) < 1e-4, (
+            f"Expected {expected:.4f}, got {body['smoothed_wind_ms']}"
         )
         assert body["is_outlier"] is False
+
+    def test_surface_water_temp_returned(self, client: TestClient) -> None:
+        """
+        The /ingest response must echo the ingested surface (0m) water
+        temperature so callers can confirm the vertical profile was stored.
+        """
+        payload = _valid_payload()
+        payload["water_temp_profile"]["0m"] = 16.7
+        response = client.post("/ingest", json=payload)
+
+        assert response.status_code == 200
+        assert abs(response.json()["surface_water_temp_c"] - 16.7) < 1e-3
 
 
 class TestForecastEndpoint:
@@ -207,70 +226,67 @@ class TestForecastEndpoint:
 
     def test_forecast_insufficient_data(self, client: TestClient) -> None:
         """
-        The forecast endpoint should return HTTP 422 when the database
-        contains fewer than 10 clean records, since a linear regression
-        on fewer points would be statistically meaningless.
+        /forecast must return HTTP 422 on an empty database — not enough
+        signal to produce a meaningful linear regression.
         """
         response = client.get("/forecast")
-
         assert response.status_code == 422, (
-            f"Expected 422 on empty DB, got {response.status_code}: {response.text}"
+            f"Expected 422 on empty DB, got {response.status_code}"
         )
 
     def test_forecast_returns_valid_structure(self, client: TestClient) -> None:
         """
-        After ingesting enough clean records, /forecast should return a
-        response with all required fields and a sensible trend value.
+        After ingesting 15 clean records with a rising surface temperature
+        trend, /forecast must return a valid response with all required fields
+        and trend='rising'.
         """
-        # Ingest 15 readings with a slight rising temperature trend.
         for i in range(15):
-            client.post(
-                "/ingest",
-                json=_valid_payload(
-                    timestamp=f"2024-06-01T12:{i:02d}:00Z",
-                    temp_c=18.0 + i * 0.1,  # 0.1 °C per reading → rising
-                    wind_ms=5.0,
-                ),
+            payload = _valid_payload(
+                timestamp=f"2026-03-22T12:{i:02d}:00Z",
+                wind_speed_ms=4.0,
             )
+            # Rising surface temperature: 0.2 °C per reading
+            payload["water_temp_profile"]["0m"] = 13.0 + i * 0.2
+            client.post("/ingest", json=payload)
 
         response = client.get("/forecast")
         assert response.status_code == 200, response.text
 
         body = response.json()
-        assert "current_temp" in body
-        assert "forecast_5min_temp" in body
+        assert "current_surface_temp_c" in body
+        assert "forecast_5min_surface_temp_c" in body
         assert body["trend"] in {"rising", "falling", "stable"}
         assert 0.0 <= body["r_squared"] <= 1.0
         assert body["records_used"] >= 10
+        assert body["trend"] == "rising", (
+            f"Expected trend='rising' for a steadily increasing surface temp, "
+            f"got '{body['trend']}'"
+        )
 
 
 class TestStatusEndpoint:
     """Tests for GET /status."""
 
-    def test_status_endpoint(self, client: TestClient) -> None:
+    def test_status_returns_healthy(self, client: TestClient) -> None:
         """
-        /status should always return HTTP 200 with status='healthy' even
-        on an empty database — it is the Docker healthcheck target and must
-        never return a non-2xx code under normal operating conditions.
+        /status must return HTTP 200 with status='healthy' even on an empty
+        database — it is the Docker healthcheck target and must never 500.
         """
         response = client.get("/status")
 
         assert response.status_code == 200, response.text
-
         body = response.json()
         assert body["status"] == "healthy"
         assert isinstance(body["record_count"], int)
-        assert "system" in body
+        assert "Mendota" in body["system"]
 
     def test_status_record_count_increments(self, client: TestClient) -> None:
         """
-        After ingesting a reading the record count returned by /status
-        should increment by exactly 1.
+        After ingesting a reading the record_count in /status must increment
+        by exactly 1.
         """
         before = client.get("/status").json()["record_count"]
-
         client.post("/ingest", json=_valid_payload())
-
         after = client.get("/status").json()["record_count"]
         assert after == before + 1
 
@@ -278,44 +294,41 @@ class TestStatusEndpoint:
 class TestPydanticValidation:
     """Tests for Pydantic schema validation on POST /ingest."""
 
-    def test_pydantic_validation_missing_field(self, client: TestClient) -> None:
+    def test_missing_required_field_rejected(self, client: TestClient) -> None:
         """
-        A payload missing a required field (temp_c) should be rejected
-        with HTTP 422 Unprocessable Entity — FastAPI / Pydantic validates
-        before the handler runs, so no database write should occur.
+        A payload missing air_temp_c must be rejected with HTTP 422 before
+        touching the database — Pydantic validates at the boundary.
         """
-        incomplete_payload = {
-            "timestamp": "2024-06-01T12:00:00Z",
-            "lat": 33.7541,
-            "long": -118.2130,
-            # temp_c intentionally omitted
-            "pressure_hpa": 1013.25,
-            "wind_ms": 5.2,
-        }
-        response = client.post("/ingest", json=incomplete_payload)
-
-        assert response.status_code == 422, (
-            f"Expected 422 for missing temp_c, got {response.status_code}"
-        )
-
-    def test_pydantic_validation_out_of_range_lat(self, client: TestClient) -> None:
-        """
-        Latitude outside [-90, 90] must be rejected — a safety guard against
-        corrupted GPS fixes that would place the buoy on another planet.
-        """
-        response = client.post("/ingest", json=_valid_payload(lat=999.0))
+        payload = _valid_payload()
+        del payload["air_temp_c"]
+        response = client.post("/ingest", json=payload)
         assert response.status_code == 422
 
-    def test_pydantic_validation_negative_wind(self, client: TestClient) -> None:
+    def test_latitude_out_of_range_rejected(self, client: TestClient) -> None:
         """
-        Negative wind speed is physically impossible and indicates a sensor
-        fault.  Pydantic's ``ge=0.0`` constraint should reject it.
+        A latitude outside the Lake Mendota plausibility range (42.9–43.2)
+        must be rejected with HTTP 422 — catching GPS spoofing or unit errors.
         """
-        response = client.post("/ingest", json=_valid_payload(wind_ms=-1.0))
+        response = client.post("/ingest", json=_valid_payload(lat=0.0))
         assert response.status_code == 422
 
-    def test_pydantic_validation_empty_body(self, client: TestClient) -> None:
-        """An empty JSON body should be rejected with HTTP 422."""
+    def test_negative_wind_rejected(self, client: TestClient) -> None:
+        """
+        Negative wind speed is physically impossible and must be rejected.
+        """
+        response = client.post("/ingest", json=_valid_payload(wind_speed_ms=-1.0))
+        assert response.status_code == 422
+
+    def test_negative_chlorophyll_rejected(self, client: TestClient) -> None:
+        """
+        Negative chlorophyll concentration is physically impossible and must
+        be rejected at the Pydantic boundary.
+        """
+        response = client.post("/ingest", json=_valid_payload(chlorophyll_ugl=-5.0))
+        assert response.status_code == 422
+
+    def test_empty_body_rejected(self, client: TestClient) -> None:
+        """An empty JSON body must be rejected with HTTP 422."""
         response = client.post("/ingest", json={})
         assert response.status_code == 422
 
@@ -324,26 +337,27 @@ class TestReadingsEndpoint:
     """Tests for GET /readings."""
 
     def test_readings_empty_db(self, client: TestClient) -> None:
-        """On an empty database /readings should return count=0 and an empty list."""
+        """
+        /readings on an empty database must return HTTP 200 with count=0
+        and an empty list — not a 404 or 500.
+        """
         response = client.get("/readings")
         assert response.status_code == 200
         body = response.json()
         assert body["count"] == 0
         assert body["readings"] == []
 
-    def test_readings_returns_correct_count(self, client: TestClient) -> None:
+    def test_readings_includes_water_temp_profile(self, client: TestClient) -> None:
         """
-        After ingesting 5 records, GET /readings?n=3 should return exactly
-        3 records (the most recent 3).
+        Each reading returned by /readings must include a water_temp_profile
+        dict with all four depth keys from the NTL-LTER thermistor chain.
         """
-        for i in range(5):
-            client.post(
-                "/ingest",
-                json=_valid_payload(timestamp=f"2024-06-01T12:0{i}:00Z"),
-            )
-
-        response = client.get("/readings", params={"n": 3})
+        client.post("/ingest", json=_valid_payload())
+        response = client.get("/readings?n=1")
         assert response.status_code == 200
-        body = response.json()
-        assert body["count"] == 3
-        assert len(body["readings"]) == 3
+
+        reading = response.json()["readings"][0]
+        profile = reading["water_temp_profile"]
+        for depth in ("0m", "5m", "10m", "20m"):
+            assert depth in profile, f"Missing depth key '{depth}' in water_temp_profile"
+            assert isinstance(profile[depth], float)
