@@ -1,7 +1,7 @@
 import React from 'react'
 
 function formatTime(ts) {
-  if (!ts) return '—'
+  if (!ts) return 'N/A'
   try {
     return new Date(ts).toLocaleTimeString('en-US', {
       hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit',
@@ -12,7 +12,7 @@ function formatTime(ts) {
 }
 
 function fmt(val, decimals = 2) {
-  if (val == null) return '—'
+  if (val == null) return 'N/A'
   if (typeof val !== 'number') return val
   return val.toFixed(decimals)
 }

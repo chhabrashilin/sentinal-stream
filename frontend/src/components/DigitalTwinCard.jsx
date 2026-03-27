@@ -29,6 +29,17 @@ function TempRow({ depth, predicted, measured }) {
   )
 }
 
+const R2_BANDS = [
+  { min: 0.9, color: '#00ceb4', label: 'Excellent', desc: 'Model tracking live conditions closely.' },
+  { min: 0.7, color: '#4a8fff', label: 'Good',      desc: 'Minor disagreements from local wind events.' },
+  { min: 0.5, color: '#f59e0b', label: 'Acceptable', desc: 'Spring transition or post-turnover variance.' },
+  { min: 0.0, color: '#ff6b6b', label: 'Weak fit',  desc: 'Lake undergoing rapid change (storm, turnover).' },
+]
+
+function getR2Band(r2) {
+  return R2_BANDS.find(b => r2 >= b.min) ?? R2_BANDS[R2_BANDS.length - 1]
+}
+
 export default function DigitalTwinCard({ twin, loading }) {
   if (loading) {
     return (
@@ -58,8 +69,9 @@ export default function DigitalTwinCard({ twin, loading }) {
   }
 
   const isIce = twin.ice_mode
-  const r2Pct = Math.max(0, Math.min(1, twin.model_r2 ?? 0)) * 100
-  const r2Color = (twin.model_r2 ?? 0) >= 0.7 ? '#00ceb4' : (twin.model_r2 ?? 0) >= 0.4 ? '#f59e0b' : '#ff6b6b'
+  const r2Val = twin.model_r2 ?? 0
+  const r2Pct = Math.max(0, Math.min(1, r2Val)) * 100
+  const r2Band = getR2Band(r2Val)
 
   return (
     <div className="card">
@@ -82,11 +94,30 @@ export default function DigitalTwinCard({ twin, loading }) {
         </div>
       </div>
 
+      {/* Mode explanation */}
+      <div className="inference-block" style={{ marginBottom: 10 }}>
+        {isIce ? (
+          <div className="inference-block__body">
+            Ice-In mode: physical thermistor chains are retracted for winter. The ML model predicts
+            subsurface temperatures from air temp and wind alone, maintaining data continuity
+            through ice cover (typically December through mid-March on Mendota). Accuracy is
+            lower than live mode (+/-1-2°C vs +/-0.3-0.5°C with sensors).
+          </div>
+        ) : (
+          <div className="inference-block__body">
+            Verification mode: ML predictions are compared against live sensor readings at each depth.
+            The delta column shows model error. Persistent large errors (+/-0.8°C or more) at a
+            specific depth may indicate a localised thermal event (upwelling, nearshore heating)
+            that the atmospheric input signals alone cannot capture.
+          </div>
+        )}
+      </div>
+
       <div className="twin-header-row">
         <span className="twin-col-depth">Depth</span>
         <span className="twin-col-pred">ML Predicted</span>
         <span className="twin-col-meas">{isIce ? 'Mode' : 'Measured'}</span>
-        {!isIce && <span className="twin-col-delta">Δ Error</span>}
+        {!isIce && <span className="twin-col-delta">Dt Error</span>}
       </div>
 
       <div className="twin-rows">
@@ -96,19 +127,39 @@ export default function DigitalTwinCard({ twin, loading }) {
         <TempRow depth="20m" predicted={twin.predicted_20m_c} measured={twin.measured_20m_c} />
       </div>
 
-      {/* Model R² bar */}
+      {/* R2 bar */}
       <div className="r2-bar">
         <div className="r2-bar__header">
           <span className="r2-bar__title">Model R² (physics features)</span>
-          <span className="r2-bar__value" style={{ color: r2Color }}>
-            {(twin.model_r2 ?? 0).toFixed(3)}
+          <span className="r2-bar__value" style={{ color: r2Band.color }}>
+            {r2Val.toFixed(3)} ({r2Band.label})
           </span>
         </div>
         <div className="r2-bar__track">
           <div
             className="r2-bar__fill"
-            style={{ width: `${r2Pct}%`, background: r2Color, boxShadow: `0 0 8px ${r2Color}60` }}
+            style={{ width: `${r2Pct}%`, background: r2Band.color, boxShadow: `0 0 8px ${r2Band.color}60` }}
           />
+        </div>
+      </div>
+
+      {/* R2 interpretation */}
+      <div className="inference-block" style={{ marginTop: 10 }}>
+        <div className="inference-block__heading">R² interpretation</div>
+        <div className="inference-block__body" style={{ marginBottom: 8 }}>
+          R² measures how well the model predicts depth temperatures from surface atmospheric signals.
+          Features used: air temperature, wind speed, wind², and air x wind (captures evaporative cooling).
+          Confidence reaches full strength after ~200 clean records (about 3 minutes of streaming).
+        </div>
+        <div className="threshold-table">
+          {R2_BANDS.map(b => (
+            <div key={b.label} className={`threshold-row ${r2Val >= b.min && (R2_BANDS.indexOf(b) === 0 || r2Val < R2_BANDS[R2_BANDS.indexOf(b) - 1]?.min) ? 'threshold-row--active' : ''}`}
+              style={r2Band.label === b.label ? { borderLeftColor: b.color } : {}}>
+              <span className="threshold-label" style={{ color: b.color }}>{b.label}</span>
+              <span className="threshold-value">R² {b.min === 0 ? '< 0.5' : b.min === 0.5 ? '0.5 - 0.7' : b.min === 0.7 ? '0.7 - 0.9' : '>= 0.9'}</span>
+              <span className="threshold-desc">{b.desc}</span>
+            </div>
+          ))}
         </div>
       </div>
     </div>

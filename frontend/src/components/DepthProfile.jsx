@@ -108,7 +108,7 @@ export default function DepthProfile({ reading, loading }) {
               >
                 <div className="depth-cell__label">{d.depth}</div>
                 <div className="depth-cell__value" style={{ color: DEPTH_COLORS[i] }}>
-                  {d.temp != null ? d.temp.toFixed(1) : '—'}
+                  {d.temp != null ? d.temp.toFixed(1) : 'N/A'}
                 </div>
                 <div className="depth-cell__unit">°C</div>
               </div>

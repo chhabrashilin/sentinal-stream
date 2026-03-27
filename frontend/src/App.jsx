@@ -12,6 +12,7 @@ import ForesightCard from './components/ForesightCard.jsx'
 import IceModePanel from './components/IceModePanel.jsx'
 import NodeSwarm from './components/NodeSwarm.jsx'
 import DigitalTwinCard from './components/DigitalTwinCard.jsx'
+import VesselGuide from './components/VesselGuide.jsx'
 
 const POLL_MS = 2000
 
@@ -55,13 +56,14 @@ export default function App() {
   const [iceMode,     setIceMode]     = useState(null)
   const [nodes,       setNodes]       = useState(null)
   const [twin,        setTwin]        = useState(null)
+  const [vesselGuide, setVesselGuide] = useState(null)
   const [loading,     setLoading]     = useState(true)
   const [lastUpdated, setLastUpdated] = useState(null)
 
   const fetchAll = useCallback(async () => {
     const [
       statusData, readingsData, forecastData, stratData, buoyData,
-      foresightData, iceModeData, nodesData, twinData,
+      foresightData, iceModeData, nodesData, twinData, vesselData,
     ] = await Promise.all([
       fetchJSON('/api/status'),
       fetchJSON('/api/readings?n=60'),
@@ -72,6 +74,7 @@ export default function App() {
       fetchJSON('/api/ice-mode'),
       fetchJSON('/api/nodes'),
       fetchJSON('/api/digital-twin'),
+      fetchJSON('/api/vessel-guide'),
     ])
 
     setStatus(statusData)
@@ -83,6 +86,7 @@ export default function App() {
     setIceMode(iceModeData)
     setNodes(nodesData)
     setTwin(twinData)
+    setVesselGuide(vesselData)
     setLoading(false)
     setLastUpdated(new Date().toLocaleTimeString('en-US', { hour12: false }))
   }, [])
@@ -134,6 +138,15 @@ export default function App() {
             unit="°C"
             color="#f59e0b"
             sublabel="Buoy mast height"
+            context={
+              airTemp != null
+                ? airTemp > 25
+                  ? 'Warm air accelerates surface heating. HAB risk window elevated if wind stays calm.'
+                  : airTemp < 0
+                    ? 'Below freezing. Ice formation possible within 1-3 days. Prepare sensors for winter.'
+                    : 'Normal range for current season. Mar avg: 0-12°C. Jul avg: 20-32°C.'
+                : 'Air temp drives surface heat flux and evaporative cooling. Key input for digital twin.'
+            }
             loading={loading && airTemp == null}
           />
           <MetricCard
@@ -142,6 +155,19 @@ export default function App() {
             unit="m/s"
             color="#4a8fff"
             sublabel="10-pt smoothed"
+            context={
+              windSmooth != null
+                ? windSmooth < 2
+                  ? 'Calm. Algae scum may form at surface. HAB risk elevated if conditions persist 3+ days.'
+                  : windSmooth < 5
+                    ? 'Light wind. Minimal mixing. Cyanobacteria can aggregate at surface.'
+                    : windSmooth < 8
+                      ? 'Moderate wind disrupting surface algae accumulation.'
+                      : windSmooth < 15
+                        ? 'Strong mixing. Bloom disruption likely. Small craft exercise caution.'
+                        : 'Dangerous wind. All small craft should be off the water.'
+                : 'Wind is the primary lake mixing driver. Above 5 m/s disrupts HAB blooms. Below 2 m/s for 3+ days is the classic HAB setup.'
+            }
             loading={loading && windSmooth == null}
           />
           <MetricCard
@@ -150,6 +176,19 @@ export default function App() {
             unit="°C"
             color="#00ceb4"
             sublabel="Depth 0 m (epilimnion)"
+            context={
+              surfaceTemp != null
+                ? surfaceTemp < 5
+                  ? 'Critical cold water. Survival time under 30 min without drysuit. No swimming.'
+                  : surfaceTemp < 10
+                    ? 'High hypothermia risk. Incapacitation in 7-30 min. Wetsuit + PFD required.'
+                    : surfaceTemp < 15
+                      ? 'Moderate cold water risk. Dress for immersion, not air temperature.'
+                      : surfaceTemp < 20
+                        ? 'Cool but manageable. Wetsuit recommended for multi-hour activities.'
+                        : 'Comfortable. Cyanobacteria thrive above 20°C. Monitor chl-a closely.'
+                : 'Surface temp drives stratification, HAB risk, and cold water survival time.'
+            }
             loading={loading && surfaceTemp == null}
           />
           <MetricCard
@@ -158,6 +197,19 @@ export default function App() {
             unit="µg/L"
             color="#a78bfa"
             sublabel="HAB proxy indicator"
+            context={
+              chlorophyll != null
+                ? chlorophyll < 5
+                  ? 'Excellent. Crystal clear water. No algal concerns.'
+                  : chlorophyll < 15
+                    ? 'Good. Slight greenish tinge. Normal seasonal appearance.'
+                    : chlorophyll < 30
+                      ? 'Fair. Noticeably green. Shore foam possible. Rinse after water contact.'
+                      : chlorophyll < 70
+                        ? 'HAB Advisory. Avoid skin contact. Paint-like green surface. Cyanotoxin risk.'
+                        : 'HAB Warning. Do not enter the water. Notify Wisconsin DNR. Close beaches.'
+                : 'Chl-a is a proxy for algal biomass. Above 30 ug/L = HAB advisory. Above 70 ug/L = HAB warning. Historical Mendota peak: 300+ ug/L in severe summers.'
+            }
             loading={loading && chlorophyll == null}
           />
           <MetricCard
@@ -166,6 +218,7 @@ export default function App() {
             unit=""
             color="#4a8fff"
             sublabel="In database"
+            context="Number of sensor readings ingested since last reset. Outliers are stored but flagged. The digital twin retrains every 100 new records."
             loading={loading && recordCount == null}
           />
         </div>
@@ -217,6 +270,12 @@ export default function App() {
 
         {/* Edge node swarm */}
         <NodeSwarm nodes={nodeList} loading={loading && !nodes} />
+
+        {/* Vessel & recreation guide */}
+        <VesselGuide
+          guide={vesselGuide?.error ? { error: true, status: vesselGuide.status } : vesselGuide}
+          loading={loading && !vesselGuide}
+        />
 
         {/* Activity safety assessment */}
         <ActivitySafety

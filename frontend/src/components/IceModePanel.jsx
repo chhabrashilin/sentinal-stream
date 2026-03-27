@@ -35,8 +35,13 @@ export default function IceModePanel({ iceMode, onToggle, loading }) {
           </div>
           <div className="ice-panel__subtitle">
             {enabled
-              ? 'Physical sensors retracted — digital twin running on ML estimation.'
-              : 'Physical sensors online — digital twin in live verification mode.'}
+              ? 'Physical sensors retracted. Digital twin running on ML estimation only.'
+              : 'Physical sensors online. Digital twin in live verification mode.'}
+          </div>
+          <div className="ice-panel__context">
+            {enabled
+              ? 'Activate during ice cover (typically late November through mid-March on Mendota). The ML model predicts subsurface water temperatures from air temp and wind alone, maintaining data continuity year-round. Accuracy is lower than live mode (+/-1-2°C vs +/-0.3-0.5°C with sensors deployed).'
+              : 'Activate when buoy technicians retract the thermistor chain for winter. Keep off during the open-water season so the digital twin can compare ML predictions against live sensor readings.'}
           </div>
         </div>
       </div>

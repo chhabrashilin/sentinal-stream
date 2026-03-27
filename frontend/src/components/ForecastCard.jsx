@@ -1,29 +1,57 @@
 import React from 'react'
 
 const TREND = {
-  rising:  { icon: '↑', label: 'Rising',  cls: 'badge--rising',  color: '#ff6b6b' },
-  falling: { icon: '↓', label: 'Falling', cls: 'badge--falling', color: '#4a8fff' },
-  stable:  { icon: '→', label: 'Stable',  cls: 'badge--stable',  color: '#64748b' },
+  rising:  { icon: 'up', label: 'Rising',  cls: 'badge--rising',  color: '#ff6b6b' },
+  falling: { icon: 'dn', label: 'Falling', cls: 'badge--falling', color: '#4a8fff' },
+  stable:  { icon: '->', label: 'Stable',  cls: 'badge--stable',  color: '#64748b' },
 }
+
+const TREND_CONTEXT = {
+  rising: {
+    what: 'Surface water is warming over the last ~100 readings.',
+    ecology: 'Rising surface temp in spring/summer accelerates stratification onset and increases HAB risk window. A rapid rise (+0.5°C or more in 5 minutes under current conditions) may indicate solar heating amplified by reduced cloud cover or reduced wind mixing.',
+    action: 'Monitor foresight HAB score. If stratification status is "weakly stratified" and HAB score is above 30, prepare advisory communications.',
+  },
+  falling: {
+    what: 'Surface water is cooling over the last ~100 readings.',
+    ecology: 'Falling surface temperature in summer can be a precursor to fall overturn. A rapid fall while the column is stratified means the surface and deep layers are approaching the same density. If this persists with elevated wind (above 8 m/s), full turnover is possible within 24-48 hours. In spring, this is normal post ice-out behaviour.',
+    action: 'Check foresight turnover score. If above 0.5 and stratification is "weakly stratified", issue a waterway advisory.',
+  },
+  stable: {
+    what: 'Surface temperature is holding steady within +/-0.1°C over the forecast window.',
+    ecology: 'Thermal stability indicates a balance between solar input and mixing or evaporative cooling. This is the most common state during calm summer afternoons. Stable temperature does not mean low risk: a stagnant, stable surface layer is optimal for cyanobacterial bloom development.',
+    action: 'Check wind speed and chlorophyll-a. Calm + stable + high chl-a = elevated HAB risk despite stable temperature trend.',
+  },
+}
+
+const R2_LABELS = [
+  { min: 0.7, label: 'Good fit',     color: '#00ceb4' },
+  { min: 0.4, label: 'Moderate fit', color: '#f59e0b' },
+  { min: 0.0, label: 'Poor fit',     color: '#ff6b6b' },
+]
 
 function R2Bar({ value }) {
   const pct   = Math.max(0, Math.min(1, value)) * 100
-  const color = value >= 0.7 ? '#00ceb4' : value >= 0.4 ? '#f59e0b' : '#ff6b6b'
-  const label = value >= 0.7 ? 'Good fit' : value >= 0.4 ? 'Moderate fit' : 'Poor fit'
+  const band  = R2_LABELS.find(b => value >= b.min) ?? R2_LABELS[R2_LABELS.length - 1]
 
   return (
     <div className="r2-bar">
       <div className="r2-bar__header">
         <span className="r2-bar__title">R² Model Confidence</span>
-        <span className="r2-bar__value" style={{ color }}>
-          {value.toFixed(3)}, {label}
+        <span className="r2-bar__value" style={{ color: band.color }}>
+          {value.toFixed(3)}, {band.label}
         </span>
       </div>
       <div className="r2-bar__track">
         <div
           className="r2-bar__fill"
-          style={{ width: `${pct}%`, background: color, boxShadow: `0 0 8px ${color}60` }}
+          style={{ width: `${pct}%`, background: band.color, boxShadow: `0 0 8px ${band.color}60` }}
         />
+      </div>
+      <div className="r2-bar__context">
+        R² close to 1.0 = strong linear temperature trend (reliable forecast). R² near 0 = irregular
+        temperature fluctuations; forecast is less reliable. Low R² during calm conditions often
+        indicates the sensor is detecting sub-minute thermal micro-turbulence.
       </div>
     </div>
   )
@@ -58,6 +86,8 @@ export default function ForecastCard({ forecast, loading }) {
   }
 
   const trend = TREND[forecast.trend] ?? TREND.stable
+  const ctx   = TREND_CONTEXT[forecast.trend] ?? TREND_CONTEXT.stable
+  const delta = forecast.forecast_5min_surface_temp_c - forecast.current_surface_temp_c
 
   return (
     <div className="card">
@@ -67,7 +97,7 @@ export default function ForecastCard({ forecast, loading }) {
           <div className="card-subtitle">Linear regression · {forecast.records_used} records used</div>
         </div>
         <div className={`badge ${trend.cls}`}>
-          {trend.icon} {trend.label}
+          {trend.label}
         </div>
       </div>
 
@@ -81,8 +111,10 @@ export default function ForecastCard({ forecast, loading }) {
         </div>
 
         <div className="forecast-arrow">
-          <div className="forecast-arrow__icon" style={{ color: trend.color }}>{trend.icon}</div>
-          <div className="forecast-arrow__label">5 min</div>
+          <div className="forecast-arrow__icon" style={{ color: trend.color }}>
+            {delta > 0 ? '+' : ''}{delta.toFixed(2)}°C
+          </div>
+          <div className="forecast-arrow__label">in 5 min</div>
         </div>
 
         <div className="forecast-temp-block">
@@ -95,6 +127,18 @@ export default function ForecastCard({ forecast, loading }) {
       </div>
 
       <R2Bar value={forecast.r_squared} />
+
+      {/* Trend context */}
+      <div className="inference-block" style={{ marginTop: 12 }}>
+        <div className="inference-block__heading" style={{ color: trend.color }}>
+          Trend: {trend.label}. {ctx.what}
+        </div>
+        <div className="inference-block__body">{ctx.ecology}</div>
+        <div className="inference-action-note">
+          <span className="inference-action-note__label">Action: </span>
+          {ctx.action}
+        </div>
+      </div>
     </div>
   )
 }

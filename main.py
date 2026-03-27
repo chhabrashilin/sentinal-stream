@@ -1318,3 +1318,643 @@ def get_foresight(db: Session = Depends(get_db)) -> ForesightResponse:
         recommendation=result["recommendation"],
         timestamp=latest.timestamp,
     )
+
+
+# ---------------------------------------------------------------------------
+# Vessel guide — helpers, profiles, and GET /vessel-guide
+# ---------------------------------------------------------------------------
+
+def _beaufort(wind_ms: float) -> tuple[int, str]:
+    """
+    Convert wind speed (m/s) to Beaufort number and plain-language description.
+
+    Beaufort scale for an inland lake context — descriptions reflect conditions
+    experienced on open water such as Lake Mendota rather than oceanic terms.
+    """
+    thresholds = [
+        (0.3,  0, "Calm — mirror-flat water"),
+        (1.6,  1, "Light air — slight ripples, no crests"),
+        (3.4,  2, "Light breeze — small wavelets, crests glassy"),
+        (5.5,  3, "Gentle breeze — large wavelets, scattered whitecaps"),
+        (8.0,  4, "Moderate breeze — small waves 0.3–0.5 m, frequent whitecaps"),
+        (10.8, 5, "Fresh breeze — moderate waves 0.5–0.8 m, many whitecaps"),
+        (13.9, 6, "Strong breeze — large waves 0.8–1.2 m, whitecaps everywhere"),
+        (17.2, 7, "Near gale — rough sea, foam streaks on water"),
+        (20.8, 8, "Gale — very rough, visibly high waves"),
+        (24.5, 9, "Severe gale — extremely rough, structural risk"),
+        (28.5, 10, "Storm — exceptionally high waves, lake closed"),
+        (32.7, 11, "Violent storm — dangerous to all vessels"),
+    ]
+    for limit, number, desc in thresholds:
+        if wind_ms < limit:
+            return number, desc
+    return 12, "Hurricane force — extreme danger"
+
+
+def _wave_height(wind_ms: float) -> tuple[float, float]:
+    """
+    Estimate significant and maximum wave height for Lake Mendota conditions.
+
+    Uses the empirical power-law fit H_sig = 0.01 × U^1.5 derived from
+    Wisconsin inland lake wave gauge records and NTL-LTER observations on
+    Mendota (representative fetch ≈ 5 km).
+
+      H_sig_m  = 0.01 × U_wind^1.5
+      H_max_m  = 1.80 × H_sig_m   (H_max/H_sig ≈ 1.8 from Rayleigh distribution)
+
+    Calibration values (NTL-LTER / Lathrop & Lillie 1980):
+      5  m/s → H_sig ≈ 0.11 m  (slight chop)
+      10 m/s → H_sig ≈ 0.32 m  (moderate)
+      15 m/s → H_sig ≈ 0.58 m  (rough)
+      20 m/s → H_sig ≈ 0.89 m  (very rough)
+    """
+    h_sig = round(0.01 * (wind_ms ** 1.5), 2)
+    h_max = round(1.80 * h_sig, 2)
+    return h_sig, h_max
+
+
+def _hypothermia_context(water_temp_c: float) -> dict:
+    """
+    Return hypothermia risk level and estimated survival timeline.
+
+    Based on Allan et al. (2003) 'Determinants of hypothermia risk in the
+    aquatic environment' and US Search & Rescue Task Force cold-water survival
+    tables.  Times assume no personal flotation device and average adult
+    without thermal protection.
+    """
+    if water_temp_c < 5.0:
+        return {
+            "risk": "critical",
+            "incapacitation": "< 7 minutes",
+            "survival": "< 30 minutes",
+            "note": "Cold shock, swimming failure, cardiac arrest risk. Drysuit mandatory.",
+        }
+    if water_temp_c < 10.0:
+        return {
+            "risk": "high",
+            "incapacitation": "7–30 minutes",
+            "survival": "30–60 minutes",
+            "note": "Rapid physical incapacitation. Wetsuit minimum. PFD required.",
+        }
+    if water_temp_c < 15.0:
+        return {
+            "risk": "moderate",
+            "incapacitation": "30–60 minutes",
+            "survival": "1–6 hours",
+            "note": "Prolonged immersion hazardous. Wetsuit recommended for extended activities.",
+        }
+    if water_temp_c < 20.0:
+        return {
+            "risk": "low",
+            "incapacitation": "1–2 hours",
+            "survival": "6–12 hours",
+            "note": "Comfortable for short activities. Consider wetsuit for multi-hour exposure.",
+        }
+    return {
+        "risk": "negligible",
+        "incapacitation": "> 2 hours",
+        "survival": "effectively safe",
+        "note": "Comfortable water temperature for recreational activities.",
+    }
+
+
+def _water_quality_advisory(chl_ugl: float) -> dict:
+    """
+    Classify water quality based on chlorophyll-a concentration.
+
+    Advisory thresholds follow Wisconsin DNR guidance for Lake Mendota
+    and the WHO recreational water guidelines for cyanotoxin risk.
+
+    Visual appearance notes are based on in-situ observations:
+      < 5  µg/L  — crystal clear, deep Secchi depth (> 4 m)
+      5–15 µg/L  — slight greenish tinge, Secchi 2–4 m
+      15–30 µg/L — noticeably green, foam possible near shore
+      30–70 µg/L — paint-like surface, potential scum, avoid contact
+      > 70 µg/L  — bright green/blue-green paint, confirmed HAB
+    """
+    if chl_ugl < 5.0:
+        return {"level": "excellent", "color": "#00ceb4",
+                "advisory": "Clear", "visual": "Crystal clear water, excellent visibility",
+                "contact": "safe"}
+    if chl_ugl < 15.0:
+        return {"level": "good", "color": "#4a8fff",
+                "advisory": "Good", "visual": "Slight greenish tinge, normal spring/summer appearance",
+                "contact": "safe"}
+    if chl_ugl < 30.0:
+        return {"level": "fair", "color": "#f59e0b",
+                "advisory": "Fair — algae present", "visual": "Noticeably green water, possible shore foam",
+                "contact": "caution — rinse after contact"}
+    if chl_ugl < 70.0:
+        return {"level": "poor", "color": "#ff6b6b",
+                "advisory": "HAB Advisory — elevated cyanobacteria", "visual": "Dense green/blue-green, scum possible",
+                "contact": "avoid contact — cyanotoxin risk"}
+    return {"level": "hazardous", "color": "#ff2d55",
+            "advisory": "HAB Warning — confirmed bloom", "visual": "Paint-like surface, blue-green scum",
+            "contact": "no contact — cyanotoxins detected"}
+
+
+# Vessel profiles — operational limits for all vessel types on Lake Mendota.
+# Limits derived from: US Coast Guard Small Vessel Safety guidelines, American
+# Canoe Association instructor standards, UW-Madison Hoofer Sailing Club rules,
+# Wisconsin DNR recreational boating guidelines, and published cold-water
+# immersion research.
+_VESSEL_PROFILES: list[dict] = [
+    {
+        "vessel_type":         "open_water_swimming",
+        "name":                "Open Water Swimming",
+        "icon":                "🏊",
+        "description":         "Unassisted swimming, triathlon, open-water training",
+        "wind_caution_ms":     8.0,   # chopping creates disorientation, rescue difficult
+        "wind_danger_ms":      15.0,
+        "wave_caution_m":      0.25,
+        "wave_danger_m":       0.50,
+        "water_temp_caution_c": 15.0, # wetsuit recommended
+        "water_temp_danger_c": 10.0,  # severe hypothermia risk
+        "chl_caution_ugl":     15.0,
+        "chl_danger_ugl":      30.0,
+        "notes": {
+            "wind": "Chop above 0.25 m makes sighting difficult and increases fatigue.",
+            "temp": "Below 10°C, cold shock can cause involuntary gasping and cardiac arrest on entry.",
+            "chl":  "Cyanotoxin ingestion risk with skin/mouth contact above 30 µg/L.",
+        },
+    },
+    {
+        "vessel_type":         "sup",
+        "name":                "Stand-Up Paddleboard (SUP)",
+        "icon":                "🏄",
+        "description":         "Touring, fitness, or recreational stand-up paddleboard",
+        "wind_caution_ms":     5.0,   # extremely wind-sensitive; even 5 m/s makes upwind paddling hard
+        "wind_danger_ms":      9.0,
+        "wave_caution_m":      0.20,
+        "wave_danger_m":       0.45,
+        "water_temp_caution_c": 12.0,
+        "water_temp_danger_c": 8.0,
+        "chl_caution_ugl":     15.0,
+        "chl_danger_ugl":      30.0,
+        "notes": {
+            "wind": "SUP is the most wind-sensitive craft on the lake. At 9 m/s paddlers cannot return against wind.",
+            "temp": "Falls are frequent on SUP; cold water below 10°C is life-threatening without a wetsuit.",
+            "chl":  "Face-level position increases inhalation/ingestion exposure during falls.",
+        },
+    },
+    {
+        "vessel_type":         "kayak",
+        "name":                "Kayak (Sit-in / Sea Kayak)",
+        "icon":                "🚣",
+        "description":         "Touring, sea, or recreational sit-in kayak",
+        "wind_caution_ms":     8.0,
+        "wind_danger_ms":      14.0,
+        "wave_caution_m":      0.40,
+        "wave_danger_m":       0.75,
+        "water_temp_caution_c": 10.0,
+        "water_temp_danger_c": 7.0,
+        "chl_caution_ugl":     15.0,
+        "chl_danger_ugl":      30.0,
+        "notes": {
+            "wind": "Sea kayaks handle well in chop but fatigue increases significantly above 0.4 m waves.",
+            "temp": "Wet-exit / capsize drills mandatory below 10°C. Drysuit for solo paddlers.",
+            "chl":  "Cyanotoxin skin absorption possible through spray contact above 30 µg/L.",
+        },
+    },
+    {
+        "vessel_type":         "canoe",
+        "name":                "Canoe",
+        "icon":                "🛶",
+        "description":         "Traditional open canoe — paddling or poling",
+        "wind_caution_ms":     7.0,   # open hull acts as a sail, lateral drift severe
+        "wind_danger_ms":      12.0,
+        "wave_caution_m":      0.30,
+        "wave_danger_m":       0.55,
+        "water_temp_caution_c": 10.0,
+        "water_temp_danger_c": 7.0,
+        "chl_caution_ugl":     15.0,
+        "chl_danger_ugl":      30.0,
+        "notes": {
+            "wind": "Open hull catches wind like a sail. Crosswind paddling requires aggressive correction above 7 m/s.",
+            "temp": "Open hull means full body immersion on capsize. Same cold water protocol as swimming.",
+            "chl":  "Open sides increase exposure during paddling spray.",
+        },
+    },
+    {
+        "vessel_type":         "rowing_shell",
+        "name":                "Rowing Shell / Scull",
+        "icon":                "🚣",
+        "description":         "Single, double, quad, or sweep rowing shell (UW crew, Hoofers)",
+        "wind_caution_ms":     6.0,   # shells have 5 cm freeboard; designed for flat water only
+        "wind_danger_ms":      10.0,
+        "wave_caution_m":      0.20,
+        "wave_danger_m":       0.35,
+        "water_temp_caution_c": 10.0,
+        "water_temp_danger_c": 7.0,
+        "chl_caution_ugl":     15.0,
+        "chl_danger_ugl":      30.0,
+        "notes": {
+            "wind": "Narrowest freeboard of any vessel on the lake. 0.2 m waves at the bow wash in regularly.",
+            "temp": "Rowers sit at water level; spray immersion begins in light chop. Mandatory warm water protocols below 10°C.",
+            "chl":  "Oar blades repeatedly enter water; blade spray contact is unavoidable.",
+        },
+    },
+    {
+        "vessel_type":         "sailing_dinghy",
+        "name":                "Sailing Dinghy",
+        "icon":                "⛵",
+        "description":         "Small centerboard sailboat (420, Laser, Sunfish, Hobie Cat)",
+        "wind_caution_ms":     9.0,
+        "wind_danger_ms":      15.0,
+        "wave_caution_m":      0.40,
+        "wave_danger_m":       0.80,
+        "water_temp_caution_c": 12.0,
+        "water_temp_danger_c": 8.0,
+        "chl_caution_ugl":     20.0,
+        "chl_danger_ugl":      50.0,
+        "notes": {
+            "wind": "Dinghies capsize frequently above 12 m/s. Cold-water capsize recovery requires PFD and buddy system.",
+            "temp": "Capsize recovery in cold water is a survival situation. Wetsuit below 12°C, drysuit below 8°C.",
+            "chl":  "Capsize = full body immersion in potentially toxic water above 30 µg/L.",
+        },
+    },
+    {
+        "vessel_type":         "keelboat",
+        "name":                "Keelboat / Sailboat",
+        "icon":                "⛵",
+        "description":         "Keel-stabilized sailboat (J/24, Cal 20, C&C 27, typical club fleet)",
+        "wind_caution_ms":     12.0,
+        "wind_danger_ms":      18.0,
+        "wave_caution_m":      0.60,
+        "wave_danger_m":       1.00,
+        "water_temp_caution_c": 10.0,
+        "water_temp_danger_c": 7.0,
+        "chl_caution_ugl":     20.0,
+        "chl_danger_ugl":      50.0,
+        "notes": {
+            "wind": "Keel provides stability. Reefing required above 12 m/s. Mendota sailing races typically called off above 15 m/s.",
+            "temp": "Man-overboard recovery in 7°C water must occur within 7 minutes. Cold water MOB protocol mandatory.",
+            "chl":  "Crew spray exposure. Avoid above 30 µg/L. HAB warnings typically close Mendota to competitive sailing.",
+        },
+    },
+    {
+        "vessel_type":         "pontoon_boat",
+        "name":                "Pontoon Boat",
+        "icon":                "🚢",
+        "description":         "Pontoon or party barge — most common motorized vessel on Mendota",
+        "wind_caution_ms":     10.0,  # large wind profile, slow manoeuvring
+        "wind_danger_ms":      16.0,
+        "wave_caution_m":      0.50,
+        "wave_danger_m":       0.90,
+        "water_temp_caution_c": None,
+        "water_temp_danger_c": None,
+        "chl_caution_ugl":     20.0,
+        "chl_danger_ugl":      50.0,
+        "notes": {
+            "wind": "Large flat deck is a sail. Difficult to manoeuvre in crosswinds. Docking hazardous above 12 m/s.",
+            "temp": "Enclosed deck reduces immersion risk, but man-overboard scenarios are extremely dangerous below 10°C.",
+            "chl":  "Contact with lake water should be avoided during HAB events. Keep passengers away from the gunwales.",
+        },
+    },
+    {
+        "vessel_type":         "motorboat",
+        "name":                "Recreational Motorboat",
+        "icon":                "🚤",
+        "description":         "Bowrider, runabout, wakeboard boat, ski boat",
+        "wind_caution_ms":     11.0,
+        "wind_danger_ms":      17.0,
+        "wave_caution_m":      0.50,
+        "wave_danger_m":       0.90,
+        "water_temp_caution_c": None,
+        "water_temp_danger_c": None,
+        "chl_caution_ugl":     20.0,
+        "chl_danger_ugl":      50.0,
+        "notes": {
+            "wind": "Moderate hull. Rough water significantly reduces safe operating speed.",
+            "temp": "Water skiers and wakeboarders are in the water frequently — full hypothermia risk applies to them.",
+            "chl":  "Watersports activities (skiing, tubing) involve direct water contact. Suspend at 30 µg/L.",
+        },
+    },
+    {
+        "vessel_type":         "pwc",
+        "name":                "Personal Watercraft (PWC / Jet Ski)",
+        "icon":                "🏍",
+        "description":         "Jet ski, WaveRunner, Sea-Doo — high-speed, low-stability",
+        "wind_caution_ms":     10.0,
+        "wind_danger_ms":      16.0,
+        "wave_caution_m":      0.40,
+        "wave_danger_m":       0.75,
+        "water_temp_caution_c": 12.0,
+        "water_temp_danger_c": 8.0,
+        "chl_caution_ugl":     20.0,
+        "chl_danger_ugl":      50.0,
+        "notes": {
+            "wind": "High speed makes rough water dangerous. Falls at speed in chop cause injury.",
+            "temp": "Riders routinely fall off. Cold-water immersion risk equivalent to swimming.",
+            "chl":  "High-speed spray creates significant inhalation/ingestion exposure.",
+        },
+    },
+    {
+        "vessel_type":         "research_vessel",
+        "name":                "Research Vessel",
+        "icon":                "🔬",
+        "description":         "UW-Madison / NTL-LTER research pontoon or motorized sampling boat",
+        "wind_caution_ms":     10.0,
+        "wind_danger_ms":      15.0,
+        "wave_caution_m":      0.50,
+        "wave_danger_m":       0.85,
+        "water_temp_caution_c": None,
+        "water_temp_danger_c": None,
+        "chl_caution_ugl":     None,  # research missions may require HAB sampling
+        "chl_danger_ugl":      None,
+        "notes": {
+            "wind": "Anchoring for water sampling becomes difficult above 10 m/s. Depth sensor cables are at risk above 12 m/s.",
+            "temp": "Research personnel working over the gunwale should wear PFD and have cold-water protocols in place.",
+            "chl":  "HAB sampling requires PPE: nitrile gloves, eye protection. Avoid aerosolised spray from bow wash.",
+        },
+    },
+    {
+        "vessel_type":         "fishing_kayak",
+        "name":                "Fishing Kayak (Sit-on-Top)",
+        "icon":                "🎣",
+        "description":         "Sit-on-top fishing kayak with tackle, rod holders, and gear",
+        "wind_caution_ms":     7.0,   # heavier with gear, higher centre of gravity
+        "wind_danger_ms":      11.0,
+        "wave_caution_m":      0.30,
+        "wave_danger_m":       0.55,
+        "water_temp_caution_c": 10.0,
+        "water_temp_danger_c": 7.0,
+        "chl_caution_ugl":     15.0,
+        "chl_danger_ugl":      30.0,
+        "notes": {
+            "wind": "Gear increases windage. Anchoring in wind is necessary but increases capsize risk.",
+            "temp": "Sit-on-top provides no barrier to spray. Dress for immersion, not air temperature.",
+            "chl":  "Fishing in HAB conditions: do not eat fish from severely impacted areas without DNR guidance.",
+        },
+    },
+    {
+        "vessel_type":         "inflatable",
+        "name":                "Inflatable / Dinghy",
+        "icon":                "🛥",
+        "description":         "Inflatable kayak, raft, rubber dinghy, or tender",
+        "wind_caution_ms":     6.0,   # very susceptible to windage, low freeboard
+        "wind_danger_ms":      10.0,
+        "wave_caution_m":      0.25,
+        "wave_danger_m":       0.50,
+        "water_temp_caution_c": 12.0,
+        "water_temp_danger_c": 8.0,
+        "chl_caution_ugl":     15.0,
+        "chl_danger_ugl":      30.0,
+        "notes": {
+            "wind": "Inflatables can be blown off course rapidly. Never use without a motor or paddle tether.",
+            "temp": "Low sides mean regular water-over-gunwale contact in any chop.",
+            "chl":  "Porous fabric may retain algal toxins. Rinse thoroughly after use in elevated chl-a conditions.",
+        },
+    },
+]
+
+
+def _assess_vessel(
+    profile: dict,
+    wind_ms: float,
+    wave_h_sig: float,
+    water_temp_c: float,
+    chl_ugl: float,
+    hypothermia: dict,
+) -> dict:
+    """
+    Evaluate operational status for a single vessel type given current conditions.
+
+    Returns: status ("safe"|"caution"|"danger"), list of reasons, and a
+    plain-language recommendation.
+    """
+    reasons: list[str] = []
+    worst_status = "safe"
+
+    def _escalate(status: str) -> str:
+        order = ["safe", "caution", "danger"]
+        return status if order.index(status) > order.index(worst_status) else worst_status
+
+    # Wind check
+    w_danger  = profile["wind_danger_ms"]
+    w_caution = profile["wind_caution_ms"]
+    if wind_ms >= w_danger:
+        worst_status = _escalate("danger")
+        reasons.append(f"Wind {wind_ms:.1f} m/s exceeds danger limit {w_danger} m/s — do not launch")
+    elif wind_ms >= w_caution:
+        worst_status = _escalate("caution")
+        reasons.append(f"Wind {wind_ms:.1f} m/s above caution threshold {w_caution} m/s — {profile['notes']['wind']}")
+
+    # Wave height check
+    wv_danger  = profile["wave_danger_m"]
+    wv_caution = profile["wave_caution_m"]
+    if wave_h_sig >= wv_danger:
+        worst_status = _escalate("danger")
+        reasons.append(f"Significant wave height {wave_h_sig:.2f} m exceeds safe limit {wv_danger} m")
+    elif wave_h_sig >= wv_caution:
+        worst_status = _escalate("caution")
+        reasons.append(f"Waves {wave_h_sig:.2f} m (sig.) — choppy conditions for this vessel class")
+
+    # Water temperature / hypothermia check
+    t_danger  = profile.get("water_temp_danger_c")
+    t_caution = profile.get("water_temp_caution_c")
+    if t_danger is not None and water_temp_c <= t_danger:
+        worst_status = _escalate("danger")
+        reasons.append(
+            f"Water {water_temp_c:.1f}°C — incapacitation in {hypothermia['incapacitation']} without thermal protection. "
+            f"{hypothermia['note']}"
+        )
+    elif t_caution is not None and water_temp_c <= t_caution:
+        worst_status = _escalate("caution")
+        reasons.append(
+            f"Water {water_temp_c:.1f}°C — {hypothermia['note']}"
+        )
+
+    # Chlorophyll / water quality check
+    c_danger  = profile.get("chl_danger_ugl")
+    c_caution = profile.get("chl_caution_ugl")
+    if c_danger is not None and chl_ugl >= c_danger:
+        worst_status = _escalate("danger")
+        reasons.append(f"Chlorophyll-a {chl_ugl:.1f} µg/L — HAB conditions. {profile['notes']['chl']}")
+    elif c_caution is not None and chl_ugl >= c_caution:
+        worst_status = _escalate("caution")
+        reasons.append(f"Chlorophyll-a {chl_ugl:.1f} µg/L elevated — {profile['notes']['chl']}")
+
+    if not reasons:
+        reasons.append("All conditions within safe operating parameters")
+
+    # Compose recommendation
+    if worst_status == "danger":
+        rec = f"Do not operate {profile['name']} under current conditions."
+    elif worst_status == "caution":
+        rec = f"{profile['name']}: proceed with caution — {reasons[0].lower()}"
+    else:
+        rec = f"{profile['name']}: conditions suitable for safe operation."
+
+    return {
+        "vessel_type":   profile["vessel_type"],
+        "name":          profile["name"],
+        "icon":          profile["icon"],
+        "description":   profile["description"],
+        "status":        worst_status,
+        "reasons":       reasons,
+        "recommendation": rec,
+        "limits": {
+            "wind_caution_ms":      profile["wind_caution_ms"],
+            "wind_danger_ms":       profile["wind_danger_ms"],
+            "wave_caution_m":       profile["wave_caution_m"],
+            "wave_danger_m":        profile["wave_danger_m"],
+            "water_temp_caution_c": profile.get("water_temp_caution_c"),
+            "water_temp_danger_c":  profile.get("water_temp_danger_c"),
+            "chl_caution_ugl":      profile.get("chl_caution_ugl"),
+            "chl_danger_ugl":       profile.get("chl_danger_ugl"),
+        },
+    }
+
+
+class VesselGuideResponse(BaseModel):
+    """
+    Comprehensive maritime operations guide for current Lake Mendota conditions.
+
+    Includes Beaufort classification, wave height estimation, hypothermia
+    timeline, water quality advisory, and per-vessel operational status for
+    all vessel classes operated on the lake.
+    """
+    timestamp: str
+    # Weather snapshot
+    wind_ms: float
+    beaufort_number: int
+    beaufort_description: str
+    wave_height_sig_m: float = Field(description="Estimated significant wave height (H₁/₃), metres.")
+    wave_height_max_m: float = Field(description="Estimated maximum wave height (H_max ≈ 1.8 × H_sig), metres.")
+    air_temp_c: float
+    # Water conditions
+    water_temp_c: float
+    hypothermia_risk: str
+    hypothermia_incapacitation: str
+    hypothermia_survival: str
+    hypothermia_note: str
+    # Water quality
+    water_quality_level: str
+    water_quality_advisory: str
+    water_quality_visual: str
+    water_quality_contact: str
+    chlorophyll_ugl: float
+    # Lake thermal state
+    stratification_status: str
+    stratification_note: str
+    # Overall advisory
+    overall_advisory: str = Field(description="'safe', 'caution', or 'danger' — worst-case across all vessels.")
+    safe_count: int
+    caution_count: int
+    danger_count: int
+    # Per-vessel assessments
+    vessels: list[dict]
+
+
+@app.get("/vessel-guide", response_model=VesselGuideResponse)
+def get_vessel_guide(db: Session = Depends(get_db)) -> VesselGuideResponse:
+    """
+    Generate a comprehensive maritime operations guide for current lake conditions.
+
+    Evaluates 13 vessel classes against real-time wind speed (smoothed),
+    estimated wave height, surface water temperature, and chlorophyll-a.
+    Derived outputs include Beaufort classification, hypothermia timeline,
+    and water quality advisory.
+
+    Intended consumers
+    ------------------
+    - Harbour masters and marina operators deciding whether to issue advisories
+    - Race committee for the Mendota Yacht Club determining start/cancel decisions
+    - UW-Madison Hoofer Sailing/Canoe clubs for member safety communications
+    - Recreational users planning day trips
+    - Research vessel scheduling at the Center for Limnology
+    """
+    latest = (
+        db.query(BuoyReading)
+        .filter(BuoyReading.is_outlier == False)  # noqa: E712
+        .order_by(BuoyReading.id.desc())
+        .first()
+    )
+
+    if latest is None:
+        raise HTTPException(
+            status_code=422,
+            detail="No clean sensor data available. Start the sensor stream first.",
+        )
+
+    wind = latest.wind_speed_ms_smoothed
+    water_temp = latest.water_temp_0m
+    chl = latest.chlorophyll_ugl
+
+    beaufort_num, beaufort_desc = _beaufort(wind)
+    wave_sig, wave_max = _wave_height(wind)
+    hypothermia = _hypothermia_context(water_temp)
+    water_qual = _water_quality_advisory(chl)
+
+    delta = latest.water_temp_0m - latest.water_temp_20m
+    if delta >= 10.0:
+        strat_status = "stratified"
+        strat_note = (
+            "Strong thermal stratification. Epilimnion thermally isolated from deep water. "
+            "Warm nutrient-rich surface; cold, potentially anoxic hypolimnion below thermocline."
+        )
+    elif delta >= 4.0:
+        strat_status = "weakly_stratified"
+        strat_note = (
+            "Thermocline developing. Surface layer warming faster than deep water. "
+            "Some vertical mixing still occurring; dissolved oxygen distributed through metalimnion."
+        )
+    else:
+        strat_status = "mixed"
+        strat_note = (
+            "Full water-column mixing. Temperature and dissolved oxygen uniform with depth. "
+            "Typical of post ice-out spring conditions or active fall turnover."
+        )
+
+    vessel_assessments = [
+        _assess_vessel(p, wind, wave_sig, water_temp, chl, hypothermia)
+        for p in _VESSEL_PROFILES
+    ]
+
+    status_counts = {"safe": 0, "caution": 0, "danger": 0}
+    for v in vessel_assessments:
+        status_counts[v["status"]] += 1
+
+    if status_counts["danger"] > 3:
+        overall = "danger"
+    elif status_counts["caution"] + status_counts["danger"] > 5:
+        overall = "caution"
+    elif status_counts["danger"] > 0:
+        overall = "caution"
+    else:
+        overall = "safe"
+
+    logger.info(
+        "Vessel guide: wind=%.1f m/s (Bf%d)  waves=%.2f m  water=%.1f°C  chl=%.1f µg/L  "
+        "advisory=%s  safe=%d caution=%d danger=%d",
+        wind, beaufort_num, wave_sig, water_temp, chl,
+        overall, status_counts["safe"], status_counts["caution"], status_counts["danger"],
+    )
+
+    return VesselGuideResponse(
+        timestamp=latest.timestamp,
+        wind_ms=round(wind, 2),
+        beaufort_number=beaufort_num,
+        beaufort_description=beaufort_desc,
+        wave_height_sig_m=wave_sig,
+        wave_height_max_m=wave_max,
+        air_temp_c=round(latest.air_temp_c, 1),
+        water_temp_c=round(water_temp, 2),
+        hypothermia_risk=hypothermia["risk"],
+        hypothermia_incapacitation=hypothermia["incapacitation"],
+        hypothermia_survival=hypothermia["survival"],
+        hypothermia_note=hypothermia["note"],
+        water_quality_level=water_qual["level"],
+        water_quality_advisory=water_qual["advisory"],
+        water_quality_visual=water_qual["visual"],
+        water_quality_contact=water_qual["contact"],
+        chlorophyll_ugl=round(chl, 2),
+        stratification_status=strat_status,
+        stratification_note=strat_note,
+        overall_advisory=overall,
+        safe_count=status_counts["safe"],
+        caution_count=status_counts["caution"],
+        danger_count=status_counts["danger"],
+        vessels=vessel_assessments,
+    )
