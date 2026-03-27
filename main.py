@@ -1,34 +1,43 @@
 """
-main.py — Sentinel-Stream: Mendota Edition — FastAPI Microservice
+main.py — Sentinel-Stream v2.0 — Mendota Digital Twin
 
 Real-time environmental intelligence pipeline for Lake Mendota, Madison, WI.
-Ingests multivariate telemetry from the NTL-LTER buoy (mirrored by the
-emulator while the physical buoy is off-station for the season), applies
-outlier-aware noise filtering, and serves ML-powered 5-minute surface water
-temperature forecasts.
+Ingests 1 Hz NTL-LTER buoy telemetry from a distributed edge-node swarm,
+applies physics-informed ML to maintain a continuous digital twin of the
+lake's thermal state, and serves 48-hour foresight risk scores for HAB,
+anoxia, and lake-turnover events.
 
 Architecture overview
 ---------------------
-  POST /ingest    ← buoy packets arrive at 1 Hz
+  POST /ingest           ← 1 Hz telemetry from any registered edge node
       │
-      ├─ Pydantic validation   (physical-plausibility constraints per field)
-      ├─ Outlier detection     (wind > 20 m/s OR chlorophyll > 100 µg/L)
-      ├─ Rolling-window smooth (last 10 *clean* wind_speed_ms readings)
-      └─ SQLite persistence    (raw + smoothed wind, water temp profile,
-                                chlorophyll, outlier flag)
+      ├─ Pydantic validation   (physical-plausibility bounds per field)
+      ├─ Hard-threshold outlier (wind > 20 m/s OR chlorophyll > 100 µg/L)
+      ├─ Z-score fouling detect (|z| > 3.0 on 60-reading rolling window)
+      ├─ Rolling-window smooth  (10-point clean wind buffer)
+      └─ SQLite persistence     (all fields + node_id + fouling flags)
 
-  GET /forecast   ← queried by operators and autonomous decision systems
+  GET /digital-twin      ← physics-informed ML subsurface predictor
       │
-      └─ Linear regression on last 100 clean records
-         predicts surface water temperature (0m) 5 minutes ahead.
-         Returns trend direction and R² confidence score.
+      └─ MultiOutputRegressor (Ridge) trained on recent atmospheric+depth
+         records.  Predicts full water-column profile (0m–20m) from surface
+         air temp and wind alone — enabling continuous estimation in Ice-In mode.
 
-  GET /status         ← health probe (Docker healthcheck target)
-  GET /readings       ← recent record retrieval for dashboards / debugging
-  GET /stratification ← thermocline strength computed from depth profile
-  GET /buoy-status    ← live proxy to the real SSEC MetObs status API
+  GET /foresight         ← 48-hour risk assessment
+      │
+      └─ Scoring model for HAB (algal bloom), Anoxia (oxygen depletion),
+         and Turnover (lake overturn) risks based on stratification,
+         chlorophyll, wind energy, and surface temperature trend.
 
-Design decisions are documented inline and in README.md.
+  POST /nodes/register   ← edge node self-registration
+  GET  /nodes            ← list all registered swarm nodes
+  GET  /ice-mode         ← query current Ice-In estimation mode state
+  POST /ice-mode         ← toggle Ice-In estimation mode
+  GET  /forecast         ← 5-min surface temperature forecast (linear regression)
+  GET  /stratification   ← thermocline strength and classification
+  GET  /status           ← health probe (Docker healthcheck target)
+  GET  /readings         ← recent record retrieval for dashboards
+  GET  /buoy-status      ← live proxy to SSEC MetObs status API
 """
 
 from __future__ import annotations
@@ -45,10 +54,12 @@ import requests as http_requests
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.metrics import r2_score
+from sklearn.multioutput import MultiOutputRegressor
 from sqlalchemy import (
     Boolean, Column, Float, Integer, String,
-    create_engine, func,
+    create_engine, func, text,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -67,16 +78,11 @@ logger = logging.getLogger(__name__)
 # Database setup — SQLAlchemy 2.0 style
 # ---------------------------------------------------------------------------
 
-# SQLite is deliberately chosen for this edge-compute context: zero
-# configuration, no separate daemon, single-file portability, and sufficient
-# throughput for 1 Hz sensor data.  A production deployment (e.g., a shore
-# station collecting from multiple lake buoys) would swap this URL for
-# TimescaleDB or InfluxDB behind the same API contract.
 DATABASE_URL: str = "sqlite:///./mendota_buoy.db"
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False},  # required for SQLite + FastAPI
+    connect_args={"check_same_thread": False},
     echo=False,
 )
 
@@ -84,27 +90,23 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 class Base(DeclarativeBase):
-    """SQLAlchemy 2.0 declarative base."""
     pass
 
 
 # ---------------------------------------------------------------------------
-# ORM model
+# ORM models
 # ---------------------------------------------------------------------------
 
 class BuoyReading(Base):
     """
     Persisted buoy telemetry record — Lake Mendota NTL-LTER digital twin.
 
-    Water temperature is stored as four separate columns (one per depth)
-    rather than a JSON blob so that SQL queries can filter and aggregate
-    on individual depths without full-row deserialization — important when
-    analysing thermal stratification across thousands of records.
+    Stores the full sensor payload plus two derived quality flags:
+      is_outlier     — hard-threshold violation (wind or chlorophyll)
+      zscore_fouling — statistical spike detected by rolling Z-score filter
 
-    Both raw and smoothed wind values are stored so analysts can always
-    reconstruct the original signal and audit the smoothing behaviour.
-    The is_outlier flag partitions clean data from anomalous events for
-    post-incident forensic analysis (e.g., tracing a false HAB alert).
+    node_id links each record to the edge node that sourced it, enabling
+    per-node quality analysis across the simulated sensor swarm.
     """
 
     __tablename__ = "buoy_readings"
@@ -121,42 +123,87 @@ class BuoyReading(Base):
     wind_speed_ms_smoothed: float = Column(Float, nullable=False)
 
     # Sub-surface temperature profile — NTL-LTER sensor chain depths
-    water_temp_0m: float = Column(Float, nullable=False)   # epilimnion
-    water_temp_5m: float = Column(Float, nullable=False)   # developing thermocline
-    water_temp_10m: float = Column(Float, nullable=False)  # metalimnion
-    water_temp_20m: float = Column(Float, nullable=False)  # hypolimnion
+    water_temp_0m: float = Column(Float, nullable=False)
+    water_temp_5m: float = Column(Float, nullable=False)
+    water_temp_10m: float = Column(Float, nullable=False)
+    water_temp_20m: float = Column(Float, nullable=False)
 
     # Biological / chemical
-    # Chlorophyll-a is the primary proxy for algal biomass and HAB risk.
     chlorophyll_ugl: float = Column(Float, nullable=False)
 
-    # Outlier flag: True when any field exceeds physical plausibility bounds.
-    # Records are stored (not discarded) to preserve the full audit trail.
+    # Quality flags
     is_outlier: bool = Column(Boolean, nullable=False, default=False)
+    zscore_fouling: bool = Column(Boolean, nullable=False, default=False)
+
+    # Edge node identifier (null for legacy records from single-node deployment)
+    node_id: str = Column(String, nullable=True)
+
+
+class EdgeNode(Base):
+    """
+    Registered edge node in the Sentinel-Stream swarm.
+
+    Each Docker container running sensor_emulator.py self-registers here
+    on startup, providing a persistent record of the swarm topology for
+    dashboard display and per-node data provenance.
+    """
+
+    __tablename__ = "edge_nodes"
+
+    id: int = Column(Integer, primary_key=True, index=True)
+    node_id: str = Column(String, unique=True, nullable=False, index=True)
+    lat: float = Column(Float, nullable=False)
+    long: float = Column(Float, nullable=False)
+    location: str = Column(String, nullable=True)
+    registered_at: str = Column(String, nullable=False)
+    last_seen: str = Column(String, nullable=True)
+    reading_count: int = Column(Integer, default=0)
 
 
 # ---------------------------------------------------------------------------
-# Smoothing buffer — process-lifetime rolling window for wind
+# Constants
 # ---------------------------------------------------------------------------
 
-# Wind outlier threshold for Lake Mendota.  20 m/s is a violent storm on an
-# inland lake (Beaufort force 9) — implausible under normal conditions and
-# likely indicates anemometer saturation or mechanical fault.
+# Hard-threshold outlier detection
 WIND_OUTLIER_THRESHOLD_MS: float = 20.0
-
-# Chlorophyll outlier threshold.  Values above 100 µg/L are outside the
-# plausible range for Lake Mendota and likely indicate fluorometer lens
-# fouling rather than a genuine harmful algal bloom.
 CHLOROPHYLL_OUTLIER_THRESHOLD_UGL: float = 100.0
 
-# Rolling window length: 10 samples at 1 Hz = 10-second smoothing window.
-# Short enough to track real wind shifts on the lake; long enough to suppress
-# instrument noise from the cup anemometer on the buoy mast.
+# Rolling-window smoothing (wind)
 WINDOW_SIZE: int = 10
 
-# In-memory deque for outlier-filtered wind readings.  Process-memory rather
-# than per-request DB query keeps ingest latency constant at high throughput.
+# Z-score sensor fouling detection
+# 60 samples at 1 Hz = 60-second adaptive baseline per sensor.
+ZSCORE_WINDOW: int = 60
+ZSCORE_THRESHOLD: float = 3.0
+ZSCORE_MIN_SAMPLES: int = 15  # minimum samples before Z-score is meaningful
+
+# Physics-informed digital twin model
+MIN_TWIN_RECORDS: int = 30  # minimum clean records needed to train
+
+# ---------------------------------------------------------------------------
+# Process-lifetime state
+# ---------------------------------------------------------------------------
+
+# Outlier-filtered wind readings for rolling-average smoothing.
 rolling_buffer: Deque[float] = deque(maxlen=WINDOW_SIZE)
+
+# Per-sensor rolling buffers for Z-score fouling detection.
+# Each sensor maintains its own adaptive baseline independent of the others.
+sensor_buffers: dict[str, Deque[float]] = {
+    "air_temp_c":      deque(maxlen=ZSCORE_WINDOW),
+    "wind_speed_ms":   deque(maxlen=ZSCORE_WINDOW),
+    "water_temp_0m":   deque(maxlen=ZSCORE_WINDOW),
+    "chlorophyll_ugl": deque(maxlen=ZSCORE_WINDOW),
+}
+
+# Ice-In estimation mode — when True, the digital twin operates without
+# physical sensor data (sensors are retracted for winter).
+ice_mode_enabled: bool = False
+
+# Cached physics-informed model (trained lazily from DB records).
+_digital_twin_model: Optional[MultiOutputRegressor] = None
+_model_records_used: int = 0
+_model_r2: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -164,122 +211,58 @@ rolling_buffer: Deque[float] = deque(maxlen=WINDOW_SIZE)
 # ---------------------------------------------------------------------------
 
 class WaterTempProfile(BaseModel):
-    """
-    Vertical water temperature profile from the NTL-LTER thermistor chain.
-
-    Depth keys match the NTL-LTER buoy sensor chain deployment depths for
-    Lake Mendota.  Each value is the temperature in degrees Celsius at that
-    depth below the surface.
-    """
-
-    field_0m: float = Field(..., alias="0m", ge=0.0, le=35.0,
-                            description="Surface (epilimnion) temperature °C.")
-    field_5m: float = Field(..., alias="5m", ge=0.0, le=35.0,
-                            description="5 m depth temperature °C.")
-    field_10m: float = Field(..., alias="10m", ge=0.0, le=35.0,
-                             description="10 m depth temperature °C.")
-    field_20m: float = Field(..., alias="20m", ge=0.0, le=35.0,
-                             description="20 m depth (hypolimnion) temperature °C.")
+    field_0m: float = Field(..., alias="0m", ge=0.0, le=35.0)
+    field_5m: float = Field(..., alias="5m", ge=0.0, le=35.0)
+    field_10m: float = Field(..., alias="10m", ge=0.0, le=35.0)
+    field_20m: float = Field(..., alias="20m", ge=0.0, le=35.0)
 
     model_config = {"populate_by_name": True}
 
 
 class SensorReading(BaseModel):
-    """
-    Validated inbound telemetry payload from the Lake Mendota buoy.
+    """Validated inbound telemetry payload from a Lake Mendota edge node."""
 
-    Field ranges encode physical plausibility constraints for the Lake Mendota
-    site.  Values outside these bounds indicate a sensor fault or malformed
-    packet and are rejected before touching the database.
-    """
-
-    timestamp: str = Field(
-        ...,
-        description="ISO-8601 UTC timestamp of the reading.",
-        examples=["2026-03-22T20:27:00Z"],
-    )
-    location: Optional[str] = Field(
+    timestamp: str = Field(..., description="ISO-8601 UTC timestamp.")
+    location: Optional[str] = Field(default=None)
+    lat: float = Field(..., ge=42.9, le=43.2)
+    long: float = Field(..., ge=-89.6, le=-89.3)
+    air_temp_c: float = Field(..., ge=-40.0, le=50.0)
+    wind_speed_ms: float = Field(..., ge=0.0, le=60.0)
+    water_temp_profile: WaterTempProfile
+    chlorophyll_ugl: float = Field(..., ge=0.0, le=1000.0)
+    node_id: Optional[str] = Field(
         default=None,
-        description="Human-readable buoy location label.",
-    )
-    lat: float = Field(
-        ..., ge=42.9, le=43.2,
-        description="Buoy latitude in decimal degrees (Lake Mendota range).",
-    )
-    long: float = Field(
-        ..., ge=-89.6, le=-89.3,
-        description="Buoy longitude in decimal degrees (Lake Mendota range).",
-    )
-    air_temp_c: float = Field(
-        ..., ge=-40.0, le=50.0,
-        description="Air temperature at buoy mast height, degrees Celsius.",
-    )
-    wind_speed_ms: float = Field(
-        ..., ge=0.0, le=60.0,
-        description=(
-            "Wind speed in metres per second.  Values > 20 m/s are flagged "
-            "as outliers but stored for audit."
-        ),
-    )
-    water_temp_profile: WaterTempProfile = Field(
-        ...,
-        description="Vertical water temperature profile from the thermistor chain.",
-    )
-    chlorophyll_ugl: float = Field(
-        ..., ge=0.0, le=1000.0,
-        description=(
-            "Chlorophyll-a concentration in µg/L.  Values > 100 µg/L are "
-            "flagged as outliers (probable fluorometer fouling)."
-        ),
+        description="Edge node identifier (e.g. 'node-north'). Null for legacy single-node deployments.",
     )
 
     @field_validator("timestamp")
     @classmethod
     def timestamp_must_be_nonempty(cls, v: str) -> str:
-        """Reject blank timestamp strings before they reach the database."""
         if not v.strip():
             raise ValueError("timestamp must not be empty")
         return v
 
 
 class IngestResponse(BaseModel):
-    """Response body returned by POST /ingest."""
-
     status: str
-    smoothed_wind_ms: float = Field(
-        description="10-point rolling-average wind speed (m/s), outliers excluded."
+    smoothed_wind_ms: float
+    is_outlier: bool
+    zscore_fouling: bool = Field(
+        description="True if any sensor field triggered the Z-score fouling detector (|z| > 3.0)."
     )
-    is_outlier: bool = Field(
-        description="True if wind or chlorophyll exceeded the outlier threshold."
-    )
-    surface_water_temp_c: float = Field(
-        description="Ingested surface (0m) water temperature (°C)."
-    )
+    surface_water_temp_c: float
+    node_id: Optional[str]
 
 
 class ForecastResponse(BaseModel):
-    """Response body returned by GET /forecast."""
-
-    current_surface_temp_c: float = Field(
-        description="Most recent surface (0m) water temperature (°C)."
-    )
-    forecast_5min_surface_temp_c: float = Field(
-        description="Predicted surface water temperature 5 minutes from now (°C)."
-    )
-    trend: str = Field(
-        description="One of 'rising', 'falling', or 'stable' (±0.1 °C dead-band)."
-    )
-    r_squared: float = Field(
-        description="Linear regression R² score — model confidence [0, 1]."
-    )
-    records_used: int = Field(
-        description="Number of clean (non-outlier) records used to fit the model."
-    )
+    current_surface_temp_c: float
+    forecast_5min_surface_temp_c: float
+    trend: str
+    r_squared: float
+    records_used: int
 
 
 class StatusResponse(BaseModel):
-    """Response body returned by GET /status."""
-
     status: str
     record_count: int
     latest_reading: Optional[dict[str, Any]]
@@ -287,61 +270,338 @@ class StatusResponse(BaseModel):
 
 
 class ReadingsResponse(BaseModel):
-    """Response body returned by GET /readings."""
-
     count: int
     readings: list[dict[str, Any]]
 
 
 class StratificationResponse(BaseModel):
-    """Response body returned by GET /stratification."""
-
-    surface_temp_c: float = Field(description="Most recent surface (0m) water temperature (°C).")
-    deep_temp_c: float = Field(description="Most recent deep (20m) water temperature (°C).")
-    thermocline_strength_c: float = Field(
-        description=(
-            "Temperature difference between surface and 20m (°C). "
-            "Values > 4 °C indicate a well-established thermocline. "
-            "Drives mixing energy, dissolved oxygen distribution, and HAB risk."
-        )
-    )
-    stratification_status: str = Field(
-        description="One of 'stratified', 'weakly_stratified', or 'mixed'."
-    )
-    timestamp: str = Field(description="Timestamp of the most recent reading used.")
+    surface_temp_c: float
+    deep_temp_c: float
+    thermocline_strength_c: float
+    stratification_status: str
+    timestamp: str
 
 
 class BuoyStatusResponse(BaseModel):
-    """Response body returned by GET /buoy-status."""
-
     ssec_status_code: Optional[int]
     ssec_status_message: str
     ssec_last_updated: str
-    pipeline_mode: str = Field(
-        description="'live' if buoy is online and transmitting; 'emulator' otherwise."
-    )
+    pipeline_mode: str
     ssec_api_reachable: bool
 
 
+class NodeRegistration(BaseModel):
+    """Edge node self-registration payload."""
+    node_id: str = Field(..., description="Unique identifier for this edge node.")
+    lat: float = Field(..., ge=42.9, le=43.2)
+    long: float = Field(..., ge=-89.6, le=-89.3)
+    location: Optional[str] = Field(default=None)
+
+
+class NodeResponse(BaseModel):
+    node_id: str
+    lat: float
+    long: float
+    location: Optional[str]
+    registered_at: str
+    last_seen: Optional[str]
+    reading_count: int
+
+
+class IceModeRequest(BaseModel):
+    enabled: bool = Field(..., description="True to activate Ice-In estimation mode.")
+
+
+class IceModeResponse(BaseModel):
+    ice_mode_enabled: bool
+    mode: str = Field(description="'estimation' when sensors retracted, 'live' otherwise.")
+    message: str
+
+
+class DigitalTwinResponse(BaseModel):
+    """
+    Physics-informed ML prediction of the full water-column temperature profile.
+
+    In 'verification' mode (live sensors): predicted values are shown alongside
+    measured values to validate the model against ground truth.
+    In 'estimation' mode (Ice-In): measured values are None; the digital twin
+    is the sole source of subsurface thermal state.
+    """
+    surface_temp_c: float
+    predicted_5m_c: float
+    predicted_10m_c: float
+    predicted_20m_c: float
+    measured_5m_c: Optional[float]
+    measured_10m_c: Optional[float]
+    measured_20m_c: Optional[float]
+    model_r2: float = Field(description="Mean R² of the multi-output regression model.")
+    model_confidence: float = Field(description="Normalised confidence [0,1] based on training records.")
+    mode: str = Field(description="'estimation' (Ice-In) or 'verification' (live sensors).")
+    records_used: int
+    ice_mode: bool
+
+    model_config = {"protected_namespaces": ()}
+
+
+class ForesightResponse(BaseModel):
+    """48-hour environmental risk assessment for Lake Mendota."""
+    risk_score: float = Field(description="Aggregate risk score [0, 1].")
+    risk_level: str = Field(description="One of: 'low', 'moderate', 'high', 'critical'.")
+    primary_risk: str = Field(description="Dominant risk category: 'hab', 'anoxia', or 'turnover'.")
+    risk_scores: dict[str, float] = Field(description="Per-category scores.")
+    horizon_hours: int = Field(default=48)
+    contributing_factors: list[str]
+    recommendation: str
+    timestamp: str
+
+
 # ---------------------------------------------------------------------------
-# Dependency injection — database session
+# Dependency injection
 # ---------------------------------------------------------------------------
 
 def get_db() -> Any:
-    """
-    FastAPI dependency that provides a SQLAlchemy 2.0 session.
-
-    The context-manager pattern guarantees the session is closed (and any
-    open transaction rolled back on error) even when an exception propagates
-    through the endpoint handler.
-
-    Yields
-    ------
-    Session
-        An active database session bound to the request lifecycle.
-    """
     with SessionLocal() as db:
         yield db
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+def _zscore(value: float, buf: Deque[float]) -> Optional[float]:
+    """
+    Compute the absolute Z-score of *value* against the rolling buffer.
+
+    Returns None if the buffer has fewer than ZSCORE_MIN_SAMPLES entries
+    (not enough data for a meaningful baseline).  Returns 0.0 if the buffer
+    has zero variance (constant signal — sensor may be stuck, but not spiking).
+    """
+    if len(buf) < ZSCORE_MIN_SAMPLES:
+        return None
+    arr = np.array(list(buf))
+    std = float(np.std(arr))
+    if std < 1e-6:
+        return 0.0
+    return abs(float((value - float(np.mean(arr))) / std))
+
+
+def _build_twin_features(air_temp: float, wind: float) -> np.ndarray:
+    """
+    Physics-informed feature vector for the digital twin model.
+
+    Features encode the primary atmospheric forcings of lake thermal dynamics:
+      air_temp_c             — surface boundary condition (heat exchange)
+      wind_speed_ms          — mixing energy (linear)
+      wind_speed_ms²         — mixing energy (kinetic, ~ v²)
+      air_temp × wind_speed  — coupling: cold + windy = faster conductive cooling
+    """
+    return np.array([[air_temp, wind, wind ** 2, air_temp * wind]])
+
+
+def _train_digital_twin(db: Session) -> tuple[Optional[MultiOutputRegressor], int, float]:
+    """
+    Train a physics-informed multi-output regression model on recent clean records.
+
+    The model predicts the full water-column temperature profile (0m, 5m, 10m, 20m)
+    from atmospheric surface signals (air temperature + wind speed), enabling
+    digital twin estimation when physical thermistor chains are retracted for winter.
+
+    Ridge regularisation prevents overfitting on the correlated feature set and
+    ensures physically stable predictions during extrapolation.
+    """
+    records = (
+        db.query(BuoyReading)
+        .filter(BuoyReading.is_outlier == False)  # noqa: E712
+        .order_by(BuoyReading.id.desc())
+        .limit(500)
+        .all()
+    )
+
+    if len(records) < MIN_TWIN_RECORDS:
+        return None, 0, 0.0
+
+    X = np.array([
+        [r.air_temp_c, r.wind_speed_ms_smoothed,
+         r.wind_speed_ms_smoothed ** 2,
+         r.air_temp_c * r.wind_speed_ms_smoothed]
+        for r in records
+    ])
+    y = np.array([
+        [r.water_temp_0m, r.water_temp_5m, r.water_temp_10m, r.water_temp_20m]
+        for r in records
+    ])
+
+    model = MultiOutputRegressor(Ridge(alpha=1.0))
+    model.fit(X, y)
+
+    y_pred = model.predict(X)
+    r2 = float(r2_score(y, y_pred, multioutput="uniform_average"))
+
+    logger.info(
+        "Digital twin model trained: %d records, mean R²=%.3f",
+        len(records), r2,
+    )
+    return model, len(records), max(0.0, r2)
+
+
+def _compute_foresight(
+    recent_records: list,
+    strat_status: str,
+    thermo_strength: float,
+) -> dict:
+    """
+    Compute a 48-hour multi-hazard risk score for Lake Mendota.
+
+    Three risk categories are evaluated independently, then the dominant
+    risk and its score are surfaced as the actionable intelligence output:
+
+      HAB (Harmful Algal Bloom)
+        Drivers: strong stratification + elevated chlorophyll + low wind
+        Physics: calm, warm, stratified water concentrates nutrients in the
+                 epilimnion, providing ideal conditions for cyanobacteria.
+
+      Anoxia
+        Drivers: prolonged stratification + warm hypolimnion + decomposition
+        Physics: the deep layer is cut off from surface oxygen exchange; as
+                 organic matter decomposes, dissolved O2 is consumed.
+
+      Turnover
+        Drivers: rapid surface cooling + high wind + weakly stratified column
+        Physics: when surface water cools to match deep water density,
+                 a mixing event overturns the column — resurfacing anoxic water.
+    """
+    if len(recent_records) < 5:
+        return {
+            "risk_score": 0.0,
+            "risk_level": "unknown",
+            "primary_risk": "none",
+            "risk_scores": {"hab": 0.0, "anoxia": 0.0, "turnover": 0.0},
+            "contributing_factors": ["Insufficient sensor data for risk assessment"],
+            "recommendation": "Stream sensor data to enable 48-hour foresight.",
+        }
+
+    latest = recent_records[0]
+    chl = latest.chlorophyll_ugl
+    wind = latest.wind_speed_ms_smoothed
+
+    # ── HAB risk ──────────────────────────────────────────────────────────────
+    # Cyanobacterial blooms on Lake Mendota are driven by three interacting
+    # conditions: (1) thermal stratification that keeps buoyant cells near the
+    # light-rich surface, (2) elevated phosphorus/nitrogen tracked by chl-a as
+    # a biomass proxy, and (3) calm wind — field studies on Mendota show blooms
+    # collapse when sustained wind exceeds ~5–8 m/s, which erodes the
+    # thermocline and mixes cells below the photic zone.  8 m/s is used as the
+    # mixing saturation point (wind_calm_w → 0 at or above that speed).
+    strat_w     = {"stratified": 0.8, "weakly_stratified": 0.45, "mixed": 0.1}.get(strat_status, 0.1)
+    chl_w       = min(1.0, chl / 50.0)        # Wisconsin DNR concern threshold ~20 µg/L; 50 saturates
+    wind_calm_w = max(0.0, 1.0 - wind / 8.0)  # full mixing disruption above 8 m/s
+    hab = round(0.40 * strat_w + 0.35 * chl_w + 0.25 * wind_calm_w, 3)
+
+    # ── Anoxia risk ───────────────────────────────────────────────────────────
+    # Hypolimnetic anoxia in Lake Mendota occurs when the thermocline persists
+    # long enough to cut the deep layer off from surface O₂ exchange.  Warm
+    # deep-water temperatures accelerate organic decomposition (O₂ consumption
+    # rate ~ doubles every 10°C — van 't Hoff rule).  The hypolimnion at 20m
+    # in Mendota typically ranges 4°C (spring isothermal) to ~10°C (late summer
+    # peak), so we normalise over a 6°C working range rather than an
+    # unphysical 20°C range.
+    thermo_w = min(1.0, thermo_strength / 15.0)
+    deep_w   = min(1.0, max(0.0, (latest.water_temp_20m - 4.0) / 6.0))  # 4°C → 0, 10°C → 1
+    anoxia   = round(0.60 * thermo_w + 0.25 * deep_w + 0.15 * chl_w, 3)
+
+    # ── Turnover risk ─────────────────────────────────────────────────────────
+    # Fall/spring overturn occurs when the surface cools to match hypolimnion
+    # density, allowing wind to mix the full column.  The vulnerability is
+    # highest for a *weakly stratified* column (on the cusp of mixing), moderate
+    # for a *strongly stratified* column (thermal inertia delays onset but the
+    # eventual event is more dramatic), and lowest for an already *mixed* column
+    # (turnover already complete — no stratified energy available to release).
+    #
+    # Cooling rate is measured over the last 50 clean records (≈50 s at 1 Hz).
+    # Normalisation: -0.001°C/s (= -3.6°C/hour) saturates the cooling factor at 1.0.
+    # Rates below 0.001°C/s are climatologically realistic precursors; this
+    # threshold avoids false positives from instrument noise (σ ≈ 0.15°C → noise
+    # slope ≈ ±0.003°C/reading over 50 records, filtered by the max(0,...) guard).
+    clean         = [r for r in recent_records[:50] if not r.is_outlier]
+    surface_temps = [r.water_temp_0m for r in reversed(clean)]
+    if len(surface_temps) >= 10:
+        xs    = np.arange(len(surface_temps), dtype=float)
+        slope = float(np.polyfit(xs, surface_temps, 1)[0])
+        cooling_w = min(1.0, max(0.0, -slope / 0.001))
+    else:
+        cooling_w = 0.0
+
+    wind_mix_w = min(1.0, wind / 15.0)
+    vuln_w     = {"weakly_stratified": 0.9, "stratified": 0.4, "mixed": 0.1}.get(strat_status, 0.2)
+    turnover   = round(0.35 * cooling_w + 0.35 * wind_mix_w + 0.30 * vuln_w, 3)
+
+    # ── Aggregate ─────────────────────────────────────────────────────────────
+    scores = {"hab": hab, "anoxia": anoxia, "turnover": turnover}
+    primary = max(scores, key=scores.get)
+    score = scores[primary]
+
+    level = (
+        "critical" if score >= 0.70 else
+        "high"     if score >= 0.50 else
+        "moderate" if score >= 0.30 else
+        "low"
+    )
+
+    # ── Contributing factors ──────────────────────────────────────────────────
+    factors: list[str] = []
+    if strat_w >= 0.40:
+        factors.append(f"Strong thermal stratification (Δt = {thermo_strength:.1f} °C)")
+    if chl_w >= 0.30:
+        factors.append(f"Elevated chlorophyll-a ({chl:.1f} µg/L)")
+    if wind_calm_w >= 0.60:
+        factors.append(f"Low mixing energy (wind {wind:.1f} m/s — stagnant surface)")
+    if wind_mix_w >= 0.60:
+        factors.append(f"High wind speed ({wind:.1f} m/s — potential mixing event)")
+    if cooling_w >= 0.30:
+        factors.append("Rapid surface cooling — lake turnover precursor")
+    if not factors:
+        factors.append("All parameters within normal seasonal range")
+
+    # ── Recommendation ────────────────────────────────────────────────────────
+    _recs: dict[tuple, str] = {
+        ("hab", "critical"): (
+            "Issue HAB advisory. Stratified, stagnant, nutrient-rich conditions "
+            "strongly favour cyanobacterial bloom development within 48 hours."
+        ),
+        ("hab", "high"): (
+            "Monitor algal conditions. HAB risk elevated by stratification and "
+            "low mixing energy — bloom initiation possible within 48 hours."
+        ),
+        ("anoxia", "critical"): (
+            "Hypolimnetic anoxia imminent. Prolonged stratification restricting "
+            "O₂ recharge to the deep layer — benthic organisms at risk."
+        ),
+        ("anoxia", "high"): (
+            "Anoxia risk growing. Monitor dissolved oxygen at depth. Deep O₂ "
+            "depletion may stress cold-water fish species."
+        ),
+        ("turnover", "critical"): (
+            "Lake overturn likely within 48 hours. Resurfacing of anoxic hypolimnetic "
+            "water may trigger a fish kill — issue waterway advisory."
+        ),
+        ("turnover", "high"): (
+            "Turnover conditions developing. Monitor surface temperature and wind. "
+            "A significant mixing event may occur within 48 hours."
+        ),
+    }
+    recommendation = _recs.get(
+        (primary, level),
+        "Conditions within acceptable range. Continue routine 1 Hz monitoring.",
+    )
+
+    return {
+        "risk_score": round(score, 3),
+        "risk_level": level,
+        "primary_risk": primary,
+        "risk_scores": scores,
+        "contributing_factors": factors,
+        "recommendation": recommendation,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -351,21 +611,30 @@ def get_db() -> Any:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """
-    Application lifespan handler (replaces deprecated @app.on_event decorators).
-
-    Startup: creates DB tables if absent, then seeds the rolling wind buffer
-    from the most recent records so that a process restart doesn't reset
-    smoothing state — important for maintaining data continuity during
-    routine service restarts on the shore-side server.
-
-    Shutdown: logs a clean shutdown message.
+    Startup: create schema, migrate new columns, seed rolling buffer.
+    Shutdown: log clean exit.
     """
-    logger.info("Sentinel-Stream Mendota API starting up — creating database schema.")
+    logger.info("Sentinel-Stream v2.0 starting — creating database schema.")
     Base.metadata.create_all(bind=engine)
 
-    # Seed the rolling buffer from the last WINDOW_SIZE clean records so that
-    # a service restart preserves recent smoothing context rather than starting
-    # cold and producing artificially low averages on the first few packets.
+    # Additive schema migration for columns added in v2.0.
+    # SQLite's create_all() only creates missing *tables*, not missing columns,
+    # so we ALTER TABLE explicitly.  Errors are caught and ignored when the
+    # column already exists (idempotent on repeated restarts).
+    _migrations = [
+        "ALTER TABLE buoy_readings ADD COLUMN node_id TEXT",
+        "ALTER TABLE buoy_readings ADD COLUMN zscore_fouling BOOLEAN DEFAULT FALSE",
+    ]
+    with engine.connect() as conn:
+        for stmt in _migrations:
+            try:
+                conn.execute(text(stmt))
+                conn.commit()
+            except Exception:
+                pass  # column already exists
+
+    # Seed the rolling wind buffer from the most recent clean DB records so
+    # a service restart preserves smoothing context.
     with SessionLocal() as db:
         recent = (
             db.query(BuoyReading)
@@ -376,18 +645,34 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         )
         for record in reversed(recent):
             rolling_buffer.append(record.raw_wind_speed_ms)
+
+        # Seed per-sensor Z-score buffers from recent readings.
+        zseed = (
+            db.query(BuoyReading)
+            .filter(BuoyReading.is_outlier == False)  # noqa: E712
+            .order_by(BuoyReading.id.desc())
+            .limit(ZSCORE_WINDOW)
+            .all()
+        )
+        for r in reversed(zseed):
+            sensor_buffers["air_temp_c"].append(r.air_temp_c)
+            sensor_buffers["wind_speed_ms"].append(r.raw_wind_speed_ms)
+            sensor_buffers["water_temp_0m"].append(r.water_temp_0m)
+            sensor_buffers["chlorophyll_ugl"].append(r.chlorophyll_ugl)
+
         logger.info(
-            "Rolling buffer seeded with %d records from previous session.",
+            "Rolling buffer seeded: wind=%d records, Z-score buffers=%d records.",
             len(rolling_buffer),
+            len(sensor_buffers["air_temp_c"]),
         )
 
     logger.info(
-        "API ready — Lake Mendota NTL-LTER digital twin pipeline online. "
+        "Sentinel-Stream v2.0 ready — Lake Mendota NTL-LTER digital twin online. "
         "Buoy: 43.0988° N, 89.4045° W"
     )
     yield
 
-    logger.info("Sentinel-Stream Mendota API shutting down gracefully.")
+    logger.info("Sentinel-Stream v2.0 shutting down gracefully.")
 
 
 # ---------------------------------------------------------------------------
@@ -395,13 +680,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="Sentinel-Stream: Mendota Edition",
+    title="Sentinel-Stream v2.0: Mendota Edition",
     description=(
         "Real-time environmental intelligence pipeline for Lake Mendota, Madison, WI. "
-        "Ingests 1 Hz NTL-LTER buoy telemetry (atmospheric + sub-surface temperature "
-        "profile + chlorophyll-a), applies outlier-aware rolling-average filtering, "
-        "and serves ML-powered 5-minute surface water temperature forecasts. "
-        "Built as a digital twin of the UW-Madison SSEC / Center for Limnology buoy."
+        "Ingests 1 Hz NTL-LTER edge-node telemetry, applies physics-informed ML for "
+        "continuous digital twin operation, and serves 48-hour foresight risk scores "
+        "for harmful algal bloom, anoxia, and lake-turnover events."
     ),
     version="2.0.0",
     lifespan=lifespan,
@@ -425,59 +709,68 @@ def ingest_reading(
     db: Session = Depends(get_db),
 ) -> IngestResponse:
     """
-    Ingest a validated buoy telemetry packet.
+    Ingest a validated edge-node telemetry packet.
 
     Processing pipeline
     -------------------
     1. Pydantic has already validated field types and physical plausibility.
-    2. Detect outliers: wind > 20 m/s OR chlorophyll > 100 µg/L.
-       Both are flagged with the same is_outlier sentinel so downstream
-       consumers apply a single filter regardless of which variable caused it.
-    3. Update the rolling wind buffer **only** with non-outlier readings.
-       This prevents a fouled fluorometer or anemometer fault from corrupting
-       10 subsequent smoothed wind values — a real concern on Lake Mendota
-       where biofilm accumulation on sensor optics is seasonally common.
-    4. Persist the full record including raw wind, smoothed wind, all four
-       water depth temperatures, chlorophyll, and the outlier flag.
-
-    Parameters
-    ----------
-    reading:
-        Validated buoy payload from the NTL-LTER emulator.
-    db:
-        Injected SQLAlchemy session.
-
-    Returns
-    -------
-    IngestResponse
-        Confirmation with smoothed wind speed, outlier flag, and surface temp.
+    2. Hard-threshold outlier: wind > 20 m/s OR chlorophyll > 100 µg/L.
+    3. Z-score sensor fouling: |z| > 3.0 on 60-reading rolling baseline.
+       This catches rapid spikes that pass the hard threshold (e.g., a water
+       temperature that suddenly jumps 8 °C — physically impossible in 1 s).
+    4. Rolling wind buffer updated with clean readings only.
+    5. Edge node last_seen / reading_count updated if node_id provided.
+    6. Full record persisted including both quality flags.
     """
-    # An outlier is any reading where either the anemometer or the fluorometer
-    # is reporting a physically implausible value.
+    # ── Hard-threshold outlier detection ──────────────────────────────────────
     wind_outlier: bool = reading.wind_speed_ms > WIND_OUTLIER_THRESHOLD_MS
     chl_outlier: bool = reading.chlorophyll_ugl > CHLOROPHYLL_OUTLIER_THRESHOLD_UGL
     is_outlier: bool = wind_outlier or chl_outlier
 
+    # ── Z-score sensor fouling detection ──────────────────────────────────────
+    # Run Z-score check before updating the buffer so we measure against the
+    # existing baseline, not a baseline already contaminated by this reading.
+    z_checks = {
+        "air_temp_c":      _zscore(reading.air_temp_c,      sensor_buffers["air_temp_c"]),
+        "wind_speed_ms":   _zscore(reading.wind_speed_ms,    sensor_buffers["wind_speed_ms"]),
+        "water_temp_0m":   _zscore(reading.water_temp_profile.field_0m, sensor_buffers["water_temp_0m"]),
+        "chlorophyll_ugl": _zscore(reading.chlorophyll_ugl,  sensor_buffers["chlorophyll_ugl"]),
+    }
+    zscore_fouling: bool = any(
+        z is not None and z > ZSCORE_THRESHOLD for z in z_checks.values()
+    )
+
+    if zscore_fouling:
+        triggered = [k for k, z in z_checks.items() if z is not None and z > ZSCORE_THRESHOLD]
+        logger.warning(
+            "Sensor fouling detected (Z-score) — fields=%s — stored with zscore_fouling=True.",
+            triggered,
+        )
+
     if is_outlier:
         logger.warning(
-            "Outlier detected (wind_outlier=%s, chl_outlier=%s) — "
-            "wind=%.1f m/s, chl=%.1f µg/L — stored with is_outlier=True, "
-            "excluded from smoothing buffer.",
-            wind_outlier,
-            chl_outlier,
-            reading.wind_speed_ms,
-            reading.chlorophyll_ugl,
+            "Outlier detected (hard threshold) — wind_outlier=%s, chl_outlier=%s — "
+            "wind=%.1f m/s, chl=%.1f µg/L.",
+            wind_outlier, chl_outlier,
+            reading.wind_speed_ms, reading.chlorophyll_ugl,
         )
-    else:
-        # Only clean wind readings enter the rolling buffer.
+
+    # ── Update Z-score buffers (clean readings only) ───────────────────────
+    if not is_outlier and not zscore_fouling:
+        sensor_buffers["air_temp_c"].append(reading.air_temp_c)
+        sensor_buffers["wind_speed_ms"].append(reading.wind_speed_ms)
+        sensor_buffers["water_temp_0m"].append(reading.water_temp_profile.field_0m)
+        sensor_buffers["chlorophyll_ugl"].append(reading.chlorophyll_ugl)
+
+    # ── Rolling wind smoothing ────────────────────────────────────────────────
+    if not is_outlier:
         rolling_buffer.append(reading.wind_speed_ms)
 
-    # Compute smoothed wind.  Fall back to raw value on cold start (empty buffer)
-    # so the API always returns a numeric result from the first packet onward.
     smoothed_wind: float = (
         float(np.mean(list(rolling_buffer))) if rolling_buffer else reading.wind_speed_ms
     )
 
+    # ── Persist ───────────────────────────────────────────────────────────────
     record = BuoyReading(
         timestamp=reading.timestamp,
         location=reading.location,
@@ -492,28 +785,27 @@ def ingest_reading(
         water_temp_20m=reading.water_temp_profile.field_20m,
         chlorophyll_ugl=reading.chlorophyll_ugl,
         is_outlier=is_outlier,
+        zscore_fouling=zscore_fouling,
+        node_id=reading.node_id,
     )
-
     db.add(record)
-    db.commit()
 
-    logger.debug(
-        "Ingested id=%d  air=%.2f°C  water_0m=%.2f°C  wind_raw=%.2f→smooth=%.2f  "
-        "chl=%.1f µg/L  outlier=%s",
-        record.id,
-        record.air_temp_c,
-        record.water_temp_0m,
-        record.raw_wind_speed_ms,
-        record.wind_speed_ms_smoothed,
-        record.chlorophyll_ugl,
-        record.is_outlier,
-    )
+    # Update edge node activity if node_id is known
+    if reading.node_id:
+        node = db.query(EdgeNode).filter(EdgeNode.node_id == reading.node_id).first()
+        if node:
+            node.last_seen = reading.timestamp
+            node.reading_count = (node.reading_count or 0) + 1
+
+    db.commit()
 
     return IngestResponse(
         status="ok",
         smoothed_wind_ms=round(smoothed_wind, 4),
         is_outlier=is_outlier,
+        zscore_fouling=zscore_fouling,
         surface_water_temp_c=record.water_temp_0m,
+        node_id=reading.node_id,
     )
 
 
@@ -525,50 +817,11 @@ def ingest_reading(
 def get_forecast(db: Session = Depends(get_db)) -> ForecastResponse:
     """
     Generate a 5-minute surface water temperature forecast using linear regression.
-
-    The model predicts surface (0m) water temperature because thermal
-    stratification dynamics — the development and deepening of the thermocline
-    over spring and summer — are the primary scientific focus of the NTL-LTER
-    buoy deployment.  Surface temperature drives mixing energy, dissolved oxygen
-    distribution, and harmful algal bloom risk, making it the highest-value
-    forecast target for both scientific and operational users.
-
-    Methodology
-    -----------
-    Linear regression is chosen for two reasons relevant to edge deployments:
-
-      1. **Interpretability** — the slope coefficient directly represents the
-         rate of surface warming (°C/s), which scientists and operators can
-         sanity-check against known seasonal dynamics.
-
-      2. **Compute budget** — a shore-station Raspberry Pi or equivalent SBC
-         fits this model in <1 ms, leaving headroom for concurrent data logging
-         and alert evaluation.
-
-    Outlier records are excluded from the regression.  A fouled-fluorometer
-    record carrying a spurious temperature reading could invert the predicted
-    trend direction — a safety-critical error in HAB early-warning systems.
-
-    Parameters
-    ----------
-    db:
-        Injected SQLAlchemy session.
-
-    Returns
-    -------
-    ForecastResponse
-        Current surface temp, 5-min forecast, trend direction, and R² score.
-
-    Raises
-    ------
-    HTTPException(422)
-        When fewer than 10 clean records are available — the minimum for a
-        statistically meaningful linear regression.
     """
     MIN_RECORDS: int = 10
     QUERY_LIMIT: int = 100
-    FORECAST_HORIZON_S: float = 300.0  # 5 minutes
-    STABLE_BAND_C: float = 0.1         # °C dead-band for "stable" classification
+    FORECAST_HORIZON_S: float = 300.0
+    STABLE_BAND_C: float = 0.1
 
     records = (
         db.query(BuoyReading)
@@ -583,24 +836,18 @@ def get_forecast(db: Session = Depends(get_db)) -> ForecastResponse:
             status_code=422,
             detail=(
                 f"Insufficient data: {len(records)} clean records found, "
-                f"minimum {MIN_RECORDS} required for a reliable surface temperature "
-                "forecast.  Continue streaming sensor data and retry."
+                f"minimum {MIN_RECORDS} required. Continue streaming and retry."
             ),
         )
 
-    # Reverse to chronological order for time-series feature engineering.
     records = list(reversed(records))
 
     df = pd.DataFrame(
         {
-            "timestamp": [r.timestamp for r in records],
+            "timestamp":    [r.timestamp for r in records],
             "water_temp_0m": [r.water_temp_0m for r in records],
         }
     )
-
-    # Represent time as seconds relative to the first record in the window.
-    # Relative time keeps X values small and avoids precision loss in regression
-    # coefficients when using Unix epoch integers directly.
     df["time_s"] = pd.to_datetime(df["timestamp"], utc=True).astype("int64") // 10**9
     t0: int = int(df["time_s"].iloc[0])
     df["relative_s"] = df["time_s"] - t0
@@ -626,16 +873,6 @@ def get_forecast(db: Session = Depends(get_db)) -> ForecastResponse:
     else:
         trend = "falling"
 
-    logger.info(
-        "Forecast: current_0m=%.2f°C  forecast_0m=%.2f°C  trend=%s  "
-        "R²=%.3f  records=%d",
-        current_temp,
-        forecast_temp,
-        trend,
-        r_squared,
-        len(records),
-    )
-
     return ForecastResponse(
         current_surface_temp_c=round(current_temp, 3),
         forecast_5min_surface_temp_c=round(forecast_temp, 3),
@@ -651,45 +888,30 @@ def get_forecast(db: Session = Depends(get_db)) -> ForecastResponse:
 
 @app.get("/status", response_model=StatusResponse)
 def get_status(db: Session = Depends(get_db)) -> StatusResponse:
-    """
-    Health probe endpoint — the Docker healthcheck target.
-
-    Returns HTTP 200 even on an empty database so the health check passes
-    immediately after startup before the sensor emulator begins transmitting.
-
-    Parameters
-    ----------
-    db:
-        Injected SQLAlchemy session.
-
-    Returns
-    -------
-    StatusResponse
-        System health, total record count, and the most recent reading.
-    """
+    """Health probe — Docker healthcheck target."""
     record_count: int = db.query(func.count(BuoyReading.id)).scalar() or 0
 
-    latest_record = (
-        db.query(BuoyReading).order_by(BuoyReading.id.desc()).first()
-    )
+    latest_record = db.query(BuoyReading).order_by(BuoyReading.id.desc()).first()
 
     latest: Optional[dict[str, Any]] = None
     if latest_record is not None:
         latest = {
-            "id": latest_record.id,
-            "timestamp": latest_record.timestamp,
-            "air_temp_c": latest_record.air_temp_c,
-            "water_temp_0m": latest_record.water_temp_0m,
+            "id":               latest_record.id,
+            "timestamp":        latest_record.timestamp,
+            "air_temp_c":       latest_record.air_temp_c,
+            "water_temp_0m":    latest_record.water_temp_0m,
             "smoothed_wind_ms": latest_record.wind_speed_ms_smoothed,
-            "chlorophyll_ugl": latest_record.chlorophyll_ugl,
-            "is_outlier": latest_record.is_outlier,
+            "chlorophyll_ugl":  latest_record.chlorophyll_ugl,
+            "is_outlier":       latest_record.is_outlier,
+            "zscore_fouling":   latest_record.zscore_fouling,
+            "node_id":          latest_record.node_id,
         }
 
     return StatusResponse(
         status="healthy",
         record_count=record_count,
         latest_reading=latest,
-        system="Sentinel-Stream Mendota v2.0.0 | Lake Mendota NTL-LTER digital twin",
+        system="Sentinel-Stream v2.0 | Lake Mendota NTL-LTER digital twin",
     )
 
 
@@ -702,24 +924,7 @@ def get_readings(
     n: int = 20,
     db: Session = Depends(get_db),
 ) -> ReadingsResponse:
-    """
-    Retrieve the N most recent buoy readings (default 20).
-
-    Useful for populating a live dashboard or debugging the sensor stream.
-    Records are returned in reverse-chronological order (newest first).
-
-    Parameters
-    ----------
-    n:
-        Number of records to return (clamped to [1, 500]).
-    db:
-        Injected SQLAlchemy session.
-
-    Returns
-    -------
-    ReadingsResponse
-        List of recent records with all sensor fields.
-    """
+    """Retrieve the N most recent buoy readings (default 20, max 500)."""
     n = max(1, min(n, 500))
 
     records = (
@@ -731,22 +936,24 @@ def get_readings(
 
     readings = [
         {
-            "id": r.id,
-            "timestamp": r.timestamp,
-            "location": r.location,
-            "lat": r.lat,
-            "long": r.long,
-            "air_temp_c": r.air_temp_c,
-            "raw_wind_speed_ms": r.raw_wind_speed_ms,
-            "wind_speed_ms_smoothed": r.wind_speed_ms_smoothed,
+            "id":               r.id,
+            "timestamp":        r.timestamp,
+            "location":         r.location,
+            "lat":              r.lat,
+            "long":             r.long,
+            "air_temp_c":       r.air_temp_c,
+            "raw_wind_speed_ms":        r.raw_wind_speed_ms,
+            "wind_speed_ms_smoothed":   r.wind_speed_ms_smoothed,
             "water_temp_profile": {
-                "0m": r.water_temp_0m,
-                "5m": r.water_temp_5m,
+                "0m":  r.water_temp_0m,
+                "5m":  r.water_temp_5m,
                 "10m": r.water_temp_10m,
                 "20m": r.water_temp_20m,
             },
-            "chlorophyll_ugl": r.chlorophyll_ugl,
-            "is_outlier": r.is_outlier,
+            "chlorophyll_ugl":  r.chlorophyll_ugl,
+            "is_outlier":       r.is_outlier,
+            "zscore_fouling":   r.zscore_fouling,
+            "node_id":          r.node_id,
         }
         for r in records
     ]
@@ -766,37 +973,7 @@ def get_stratification(db: Session = Depends(get_db)) -> StratificationResponse:
     """
     Compute the current thermal stratification strength of Lake Mendota.
 
-    Thermocline strength is defined as the temperature difference between the
-    surface (0m epilimnion) and the deep layer (20m hypolimnion):
-
-        Δt = water_temp_0m − water_temp_20m
-
-    This is the primary metric used by the UW-Madison Center for Limnology
-    to characterise mixing dynamics and harmful algal bloom (HAB) risk:
-
-    - Δt > 10 °C  → strongly stratified; epilimnion thermally isolated;
-                    HAB conditions elevated (warm, nutrient-rich surface).
-    - 4 ≤ Δt ≤ 10 → weakly stratified; some mixing still occurring.
-    - Δt < 4 °C   → mixed; full water column turning over; lower HAB risk.
-
-    Why this matters for autonomous systems: a mission planner routing a
-    subsurface glider or ASV must know whether the water column is stratified
-    to predict dissolved oxygen distributions and safe operating depths.
-
-    Parameters
-    ----------
-    db:
-        Injected SQLAlchemy session.
-
-    Returns
-    -------
-    StratificationResponse
-        Surface temp, deep temp, Δt, and stratification status label.
-
-    Raises
-    ------
-    HTTPException(422)
-        When no clean records are available.
+    Δt = water_temp_0m − water_temp_20m
     """
     latest = (
         db.query(BuoyReading)
@@ -808,10 +985,7 @@ def get_stratification(db: Session = Depends(get_db)) -> StratificationResponse:
     if latest is None:
         raise HTTPException(
             status_code=422,
-            detail=(
-                "No clean records available.  Stream sensor data first, "
-                "then query /stratification."
-            ),
+            detail="No clean records available. Stream sensor data first.",
         )
 
     delta: float = latest.water_temp_0m - latest.water_temp_20m
@@ -822,14 +996,6 @@ def get_stratification(db: Session = Depends(get_db)) -> StratificationResponse:
         status = "weakly_stratified"
     else:
         status = "mixed"
-
-    logger.info(
-        "Stratification: 0m=%.2f°C  20m=%.2f°C  Δt=%.2f°C  status=%s",
-        latest.water_temp_0m,
-        latest.water_temp_20m,
-        delta,
-        status,
-    )
 
     return StratificationResponse(
         surface_temp_c=round(latest.water_temp_0m, 3),
@@ -846,22 +1012,7 @@ def get_stratification(db: Session = Depends(get_db)) -> StratificationResponse:
 
 @app.get("/buoy-status", response_model=BuoyStatusResponse)
 def get_buoy_status() -> BuoyStatusResponse:
-    """
-    Proxy the real SSEC MetObs buoy operational status.
-
-    Fetches live status from the UW-Madison Space Science and Engineering
-    Center (SSEC) API at metobs.ssec.wisc.edu and returns whether the
-    physical buoy is currently deployed and transmitting.
-
-    When status_code == 0 the buoy is online and scripts/fetch_ssec.py
-    --live can replace the synthetic emulator with real hardware telemetry.
-    Any other status_code means the buoy is off-station; use the emulator.
-
-    Returns
-    -------
-    BuoyStatusResponse
-        SSEC status fields plus a human-readable pipeline_mode label.
-    """
+    """Proxy the real SSEC MetObs buoy operational status."""
     try:
         resp = http_requests.get(SSEC_STATUS_URL, timeout=5)
         resp.raise_for_status()
@@ -884,3 +1035,286 @@ def get_buoy_status() -> BuoyStatusResponse:
             pipeline_mode="emulator",
             ssec_api_reachable=False,
         )
+
+
+# ---------------------------------------------------------------------------
+# POST /nodes/register
+# ---------------------------------------------------------------------------
+
+@app.post("/nodes/register", response_model=NodeResponse, status_code=200)
+def register_node(
+    reg: NodeRegistration,
+    db: Session = Depends(get_db),
+) -> NodeResponse:
+    """
+    Register or update an edge node in the Sentinel-Stream swarm.
+
+    Called automatically by sensor_emulator.py on startup. Re-registration
+    of an existing node_id updates position and last_seen (nodes may be
+    redeployed to different lake positions between seasons).
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    node = db.query(EdgeNode).filter(EdgeNode.node_id == reg.node_id).first()
+
+    if node is None:
+        node = EdgeNode(
+            node_id=reg.node_id,
+            lat=reg.lat,
+            long=reg.long,
+            location=reg.location,
+            registered_at=now,
+            last_seen=now,
+            reading_count=0,
+        )
+        db.add(node)
+        logger.info(
+            "Edge node registered: %s at (%.4f, %.4f)", reg.node_id, reg.lat, reg.long
+        )
+    else:
+        node.lat = reg.lat
+        node.long = reg.long
+        node.location = reg.location
+        node.last_seen = now
+        logger.info("Edge node re-registered: %s", reg.node_id)
+
+    db.commit()
+    db.refresh(node)
+
+    return NodeResponse(
+        node_id=node.node_id,
+        lat=node.lat,
+        long=node.long,
+        location=node.location,
+        registered_at=node.registered_at,
+        last_seen=node.last_seen,
+        reading_count=node.reading_count or 0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /nodes
+# ---------------------------------------------------------------------------
+
+@app.get("/nodes", response_model=list[NodeResponse])
+def get_nodes(db: Session = Depends(get_db)) -> list[NodeResponse]:
+    """
+    List all registered edge nodes in the Sentinel-Stream swarm.
+
+    Returns nodes ordered by registration time.  The dashboard uses this
+    to render the swarm map and per-node activity indicators.
+    """
+    nodes = db.query(EdgeNode).order_by(EdgeNode.registered_at).all()
+    return [
+        NodeResponse(
+            node_id=n.node_id,
+            lat=n.lat,
+            long=n.long,
+            location=n.location,
+            registered_at=n.registered_at,
+            last_seen=n.last_seen,
+            reading_count=n.reading_count or 0,
+        )
+        for n in nodes
+    ]
+
+
+# ---------------------------------------------------------------------------
+# GET /ice-mode
+# ---------------------------------------------------------------------------
+
+@app.get("/ice-mode", response_model=IceModeResponse)
+def get_ice_mode() -> IceModeResponse:
+    """
+    Query the current Ice-In estimation mode state.
+
+    When ice_mode_enabled is True, the Digital Twin operates in 'estimation'
+    mode — the physics-informed ML model is the sole source of subsurface
+    thermal state.  When False, the twin is in 'verification' mode, comparing
+    ML predictions to live sensor measurements.
+    """
+    return IceModeResponse(
+        ice_mode_enabled=ice_mode_enabled,
+        mode="estimation" if ice_mode_enabled else "live",
+        message=(
+            "Physical sensors retracted. Digital twin operating in ML estimation mode."
+            if ice_mode_enabled else
+            "Physical sensors online. Digital twin in live verification mode."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /ice-mode
+# ---------------------------------------------------------------------------
+
+@app.post("/ice-mode", response_model=IceModeResponse)
+def set_ice_mode(req: IceModeRequest) -> IceModeResponse:
+    """
+    Toggle Ice-In estimation mode.
+
+    Activate (enabled=true) when the physical buoy thermistor chains are
+    retracted for winter — typically late November through mid-March on
+    Lake Mendota.  The digital twin will switch to ML-only subsurface
+    temperature estimation, maintaining data continuity year-round.
+    """
+    global ice_mode_enabled
+    ice_mode_enabled = req.enabled
+    action = "activated" if req.enabled else "deactivated"
+    logger.info("Ice-In estimation mode %s.", action)
+
+    return IceModeResponse(
+        ice_mode_enabled=ice_mode_enabled,
+        mode="estimation" if ice_mode_enabled else "live",
+        message=(
+            "Ice-In mode activated. Digital twin switching to ML estimation."
+            if ice_mode_enabled else
+            "Ice-In mode deactivated. Digital twin returning to live sensor fusion."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /digital-twin
+# ---------------------------------------------------------------------------
+
+@app.get("/digital-twin", response_model=DigitalTwinResponse)
+def get_digital_twin(db: Session = Depends(get_db)) -> DigitalTwinResponse:
+    """
+    Retrieve the current physics-informed ML digital twin state.
+
+    The model (MultiOutputRegressor with Ridge regression) predicts the full
+    water-column temperature profile (0m, 5m, 10m, 20m) from atmospheric
+    surface signals (air temperature + wind speed).  It is trained lazily
+    from recent clean DB records and retrained automatically every 100 new
+    records.
+
+    Modes
+    -----
+    verification: live sensors active — ML predictions compared to measured values.
+    estimation:   Ice-In mode — ML predictions are the authoritative state.
+    """
+    global _digital_twin_model, _model_records_used, _model_r2
+
+    # Get latest atmospheric reading
+    latest = (
+        db.query(BuoyReading)
+        .filter(BuoyReading.is_outlier == False)  # noqa: E712
+        .order_by(BuoyReading.id.desc())
+        .first()
+    )
+
+    if latest is None:
+        raise HTTPException(
+            status_code=422,
+            detail="No clean records available. Stream sensor data to initialise the digital twin.",
+        )
+
+    # Retrain if model is absent or stale (100+ new records since last train)
+    current_count: int = db.query(func.count(BuoyReading.id)).scalar() or 0
+    if _digital_twin_model is None or (current_count - _model_records_used) >= 100:
+        _digital_twin_model, _model_records_used, _model_r2 = _train_digital_twin(db)
+
+    if _digital_twin_model is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Insufficient data to train digital twin model "
+                f"(need {MIN_TWIN_RECORDS} clean records, have {current_count})."
+            ),
+        )
+
+    # Predict from atmospheric signals only
+    features = _build_twin_features(latest.air_temp_c, latest.wind_speed_ms_smoothed)
+    predictions = _digital_twin_model.predict(features)[0]
+
+    # Model confidence normalised to training data size
+    confidence = min(1.0, _model_records_used / 200.0)
+
+    mode = "estimation" if ice_mode_enabled else "verification"
+
+    logger.info(
+        "Digital twin: mode=%s  air=%.2f°C  wind=%.2f m/s  "
+        "pred=[0m=%.2f, 5m=%.2f, 10m=%.2f, 20m=%.2f]°C  R²=%.3f",
+        mode,
+        latest.air_temp_c, latest.wind_speed_ms_smoothed,
+        predictions[0], predictions[1], predictions[2], predictions[3],
+        _model_r2,
+    )
+
+    return DigitalTwinResponse(
+        surface_temp_c=round(float(predictions[0]), 3),
+        predicted_5m_c=round(float(predictions[1]), 3),
+        predicted_10m_c=round(float(predictions[2]), 3),
+        predicted_20m_c=round(float(predictions[3]), 3),
+        measured_5m_c=None if ice_mode_enabled else round(latest.water_temp_5m, 3),
+        measured_10m_c=None if ice_mode_enabled else round(latest.water_temp_10m, 3),
+        measured_20m_c=None if ice_mode_enabled else round(latest.water_temp_20m, 3),
+        model_r2=round(_model_r2, 4),
+        model_confidence=round(confidence, 3),
+        mode=mode,
+        records_used=_model_records_used,
+        ice_mode=ice_mode_enabled,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /foresight
+# ---------------------------------------------------------------------------
+
+@app.get("/foresight", response_model=ForesightResponse)
+def get_foresight(db: Session = Depends(get_db)) -> ForesightResponse:
+    """
+    Generate a 48-hour environmental risk assessment for Lake Mendota.
+
+    Evaluates three hazard categories driven by the current lake state:
+
+      HAB      — harmful algal bloom risk from stratification + chl + calm wind
+      Anoxia   — deep oxygen depletion risk from prolonged stratification
+      Turnover — lake overturn risk from rapid cooling + high wind
+
+    The dominant risk category, its score, and a human-readable recommendation
+    are returned for display on the operator dashboard and autonomous alert systems.
+    """
+    MIN_RECORDS: int = 5
+
+    recent = (
+        db.query(BuoyReading)
+        .filter(BuoyReading.is_outlier == False)  # noqa: E712
+        .order_by(BuoyReading.id.desc())
+        .limit(50)
+        .all()
+    )
+
+    if len(recent) < MIN_RECORDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Insufficient data: {len(recent)} records, need {MIN_RECORDS}.",
+        )
+
+    latest = recent[0]
+    delta: float = latest.water_temp_0m - latest.water_temp_20m
+    strat_status = (
+        "stratified"        if delta >= 10.0 else
+        "weakly_stratified" if delta >= 4.0  else
+        "mixed"
+    )
+
+    result = _compute_foresight(recent, strat_status, delta)
+
+    logger.info(
+        "Foresight: risk_score=%.3f  level=%s  primary=%s  strat=%s  thermo=%.2f°C",
+        result["risk_score"], result["risk_level"], result["primary_risk"],
+        strat_status, delta,
+    )
+
+    return ForesightResponse(
+        risk_score=result["risk_score"],
+        risk_level=result["risk_level"],
+        primary_risk=result["primary_risk"],
+        risk_scores=result["risk_scores"],
+        horizon_hours=48,
+        contributing_factors=result["contributing_factors"],
+        recommendation=result["recommendation"],
+        timestamp=latest.timestamp,
+    )

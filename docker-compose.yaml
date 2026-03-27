@@ -1,6 +1,22 @@
 version: '3.8'
 
+# Sentinel-Stream v2.0 — Multi-Node Edge Swarm
+#
+# Five simulated edge nodes are distributed across Lake Mendota to model
+# 3D spatial coverage of the thermal field.  Each node runs the same
+# sensor_emulator.py image with different NODE_ID / NODE_LAT / NODE_LON
+# environment variables.
+#
+# Node positions (all within Lake Mendota bounds):
+#   center  43.0988° N, 89.4045° W  — original NTL-LTER buoy position
+#   north   43.1200° N, 89.4045° W  — northern basin
+#   south   43.0700° N, 89.4100° W  — southern narrows
+#   east    43.0900° N, 89.3750° W  — eastern shore
+#   west    43.1050° N, 89.4400° W  — western shore (near Picnic Point)
+
 services:
+
+  # ── API ──────────────────────────────────────────────────────────────────
   api:
     build: .
     container_name: sentinel-stream-api
@@ -19,15 +35,98 @@ services:
     networks:
       - sentinel-net
 
-  sensor:
+  # ── Sensor nodes ─────────────────────────────────────────────────────────
+  node-center:
     build: .
-    container_name: sentinel-stream-sensor
+    container_name: sentinel-node-center
     depends_on:
       api:
         condition: service_healthy
     command: python sensor_emulator.py
     environment:
       - API_URL=http://api:8000
+      - NODE_ID=node-center
+      - NODE_LAT=43.0988
+      - NODE_LON=-89.4045
+      - NODE_LOCATION=Lake Mendota — Center (NTL-LTER buoy position)
+      - PYTHONUNBUFFERED=1
+    restart: on-failure
+    networks:
+      - sentinel-net
+
+  node-north:
+    build: .
+    container_name: sentinel-node-north
+    depends_on:
+      api:
+        condition: service_healthy
+    command: python sensor_emulator.py
+    environment:
+      - API_URL=http://api:8000
+      - NODE_ID=node-north
+      - NODE_LAT=43.1200
+      - NODE_LON=-89.4045
+      - NODE_LOCATION=Lake Mendota — Northern Basin
+      - PACKET_DROP_RATE=0.12
+      - PYTHONUNBUFFERED=1
+    restart: on-failure
+    networks:
+      - sentinel-net
+
+  node-south:
+    build: .
+    container_name: sentinel-node-south
+    depends_on:
+      api:
+        condition: service_healthy
+    command: python sensor_emulator.py
+    environment:
+      - API_URL=http://api:8000
+      - NODE_ID=node-south
+      - NODE_LAT=43.0700
+      - NODE_LON=-89.4100
+      - NODE_LOCATION=Lake Mendota — Southern Narrows
+      - PACKET_DROP_RATE=0.08
+      - PYTHONUNBUFFERED=1
+    restart: on-failure
+    networks:
+      - sentinel-net
+
+  node-east:
+    build: .
+    container_name: sentinel-node-east
+    depends_on:
+      api:
+        condition: service_healthy
+    command: python sensor_emulator.py
+    environment:
+      - API_URL=http://api:8000
+      - NODE_ID=node-east
+      - NODE_LAT=43.0900
+      - NODE_LON=-89.3750
+      - NODE_LOCATION=Lake Mendota — Eastern Shore
+      - PACKET_DROP_RATE=0.15
+      - OUTLIER_RATE=0.04
+      - PYTHONUNBUFFERED=1
+    restart: on-failure
+    networks:
+      - sentinel-net
+
+  node-west:
+    build: .
+    container_name: sentinel-node-west
+    depends_on:
+      api:
+        condition: service_healthy
+    command: python sensor_emulator.py
+    environment:
+      - API_URL=http://api:8000
+      - NODE_ID=node-west
+      - NODE_LAT=43.1050
+      - NODE_LON=-89.4400
+      - NODE_LOCATION=Lake Mendota — Western Shore (Picnic Point)
+      - PACKET_DROP_RATE=0.10
+      - OUTLIER_RATE=0.06
       - PYTHONUNBUFFERED=1
     restart: on-failure
     networks:

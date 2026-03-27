@@ -8,6 +8,10 @@ import ForecastCard from './components/ForecastCard.jsx'
 import StratificationCard from './components/StratificationCard.jsx'
 import LiveFeed from './components/LiveFeed.jsx'
 import ActivitySafety from './components/ActivitySafety.jsx'
+import ForesightCard from './components/ForesightCard.jsx'
+import IceModePanel from './components/IceModePanel.jsx'
+import NodeSwarm from './components/NodeSwarm.jsx'
+import DigitalTwinCard from './components/DigitalTwinCard.jsx'
 
 const POLL_MS = 2000
 
@@ -24,22 +28,50 @@ async function fetchJSON(path) {
   }
 }
 
+async function postJSON(path, body) {
+  try {
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      return { error: true, status: res.status, detail: data.detail }
+    }
+    return await res.json()
+  } catch (err) {
+    return { error: true, status: 0, detail: err.message }
+  }
+}
+
 export default function App() {
   const [status,      setStatus]      = useState(null)
   const [readings,    setReadings]    = useState(null)
   const [forecast,    setForecast]    = useState(null)
   const [strat,       setStrat]       = useState(null)
   const [buoyStatus,  setBuoyStatus]  = useState(null)
+  const [foresight,   setForesight]   = useState(null)
+  const [iceMode,     setIceMode]     = useState(null)
+  const [nodes,       setNodes]       = useState(null)
+  const [twin,        setTwin]        = useState(null)
   const [loading,     setLoading]     = useState(true)
   const [lastUpdated, setLastUpdated] = useState(null)
 
   const fetchAll = useCallback(async () => {
-    const [statusData, readingsData, forecastData, stratData, buoyData] = await Promise.all([
+    const [
+      statusData, readingsData, forecastData, stratData, buoyData,
+      foresightData, iceModeData, nodesData, twinData,
+    ] = await Promise.all([
       fetchJSON('/api/status'),
       fetchJSON('/api/readings?n=60'),
       fetchJSON('/api/forecast'),
       fetchJSON('/api/stratification'),
       fetchJSON('/api/buoy-status'),
+      fetchJSON('/api/foresight'),
+      fetchJSON('/api/ice-mode'),
+      fetchJSON('/api/nodes'),
+      fetchJSON('/api/digital-twin'),
     ])
 
     setStatus(statusData)
@@ -47,6 +79,10 @@ export default function App() {
     setForecast(forecastData)
     setStrat(stratData)
     setBuoyStatus(buoyData)
+    setForesight(foresightData)
+    setIceMode(iceModeData)
+    setNodes(nodesData)
+    setTwin(twinData)
     setLoading(false)
     setLastUpdated(new Date().toLocaleTimeString('en-US', { hour12: false }))
   }, [])
@@ -57,7 +93,14 @@ export default function App() {
     return () => clearInterval(timer)
   }, [fetchAll])
 
-  // Derived metrics from the /status latest_reading snapshot
+  async function handleIceModeToggle(enabled) {
+    const result = await postJSON('/api/ice-mode', { enabled })
+    if (!result.error) {
+      setIceMode(result)
+    }
+  }
+
+  // Derived metrics
   const latest     = status?.latest_reading
   const latestFull = readings?.readings?.[0]
 
@@ -68,12 +111,20 @@ export default function App() {
   const recordCount = status?.record_count
 
   const readingRows = readings?.error ? [] : (readings?.readings ?? [])
+  const nodeList    = Array.isArray(nodes) ? nodes : []
 
   return (
     <div className="app-shell">
       <Header lastUpdated={lastUpdated} />
 
       <main className="main-content">
+
+        {/* Ice-In mode toggle */}
+        <IceModePanel
+          iceMode={iceMode?.error ? null : iceMode}
+          onToggle={handleIceModeToggle}
+          loading={loading && !iceMode}
+        />
 
         {/* KPI metric cards */}
         <div className="metric-grid">
@@ -147,6 +198,25 @@ export default function App() {
             />
           </div>
         </div>
+
+        {/* Digital Twin + Foresight panels */}
+        <div className="panel-row">
+          <div className="panel-cell">
+            <DigitalTwinCard
+              twin={twin?.error ? { error: true, status: twin.status } : twin}
+              loading={loading && !twin}
+            />
+          </div>
+          <div className="panel-cell">
+            <ForesightCard
+              foresight={foresight?.error ? { error: true, status: foresight.status } : foresight}
+              loading={loading && !foresight}
+            />
+          </div>
+        </div>
+
+        {/* Edge node swarm */}
+        <NodeSwarm nodes={nodeList} loading={loading && !nodes} />
 
         {/* Activity safety assessment */}
         <ActivitySafety

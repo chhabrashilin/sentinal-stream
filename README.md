@@ -1,19 +1,15 @@
 # Sentinel-Stream: Lake Mendota Digital Twin
 
-<<<<<<< HEAD
-=======
 Demo recording: https://youtu.be/jjXKpOC2HC8
 
 ![Sentinal Stream Demo Screenshot](./sentinal-stream-screenshot.png)
 
->>>>>>> 61b6a90047afb6e455ed3bddb35f286b46dfed56
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688?logo=fastapi&logoColor=white)
 ![React](https://img.shields.io/badge/React-18.3-61dafb?logo=react&logoColor=black)
 ![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)
 ![Tests](https://img.shields.io/badge/tests-17%20passing-brightgreen)
 
-<<<<<<< HEAD
 A full-stack environmental intelligence pipeline and live dashboard for the **UW-Madison SSEC / NTL-LTER Lake Mendota Buoy** (43.0988°N, 89.4045°W).
 
 Sensor telemetry is ingested at 1 Hz, validated, filtered for outliers, smoothed, persisted, and served through a REST API. A React dashboard visualizes wind, water temperature at 4 depths, a 5-minute ML forecast, thermal stratification status, and real-time lake activity safety assessments.

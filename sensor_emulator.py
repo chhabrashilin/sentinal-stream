@@ -57,12 +57,20 @@ import requests
 # named "api" rather than "localhost".
 API_URL: str = os.environ.get("API_URL", "http://localhost:8000")
 INGEST_ENDPOINT: str = f"{API_URL}/ingest"
+REGISTER_ENDPOINT: str = f"{API_URL}/nodes/register"
+
+# Node identity — overridden per-container in Docker Compose for the sensor swarm.
+# Each node can be placed at a distinct lake position to simulate 3D spatial coverage.
+NODE_ID: str = os.environ.get("NODE_ID", "node-center")
 
 # Lake Mendota NTL-LTER buoy position — 1.5 km NE of Picnic Point, Madison, WI.
-# Source: UW-Madison SSEC / Center for Limnology buoy metadata.
-BUOY_LAT: float = 43.0988   # degrees North
-BUOY_LON: float = -89.4045  # degrees West (negative = West)
-BUOY_LOCATION: str = "Lake Mendota, 1.5 km NE of Picnic Point, Madison, WI"
+# Individual node positions are offset from center to simulate spatial distribution.
+BUOY_LAT: float = float(os.environ.get("NODE_LAT", "43.0988"))
+BUOY_LON: float = float(os.environ.get("NODE_LON", "-89.4045"))
+BUOY_LOCATION: str = os.environ.get(
+    "NODE_LOCATION",
+    "Lake Mendota, 1.5 km NE of Picnic Point, Madison, WI",
+)
 
 # ---------------------------------------------------------------------------
 # Environmental baselines — late March (post ice-out) for Lake Mendota
@@ -169,10 +177,12 @@ def _water_temp_profile(sequence: int) -> dict[str, float]:
     dict[str, float]
         Water temperature (°C) keyed by depth string: "0m", "5m", "10m", "20m".
     """
-    # Diurnal surface warming: ±1.5 °C amplitude over 86 400 s (24 hours).
-    # Post ice-out diurnal amplitude is small — isothermal column has high
-    # thermal mass and low stratification, so solar heating distributes quickly.
-    # Summer amplitude (~1.5 °C) grows as the thermocline traps heat near surface.
+    # Post ice-out surface diurnal amplitude: ±0.3 °C over 86 400 s (24 h).
+    # In late March the water column is nearly isothermal — the full thermal
+    # mass distributes solar heating rapidly, so the epilimnion barely warms
+    # above the rest of the column.  Summer amplitude (~1.5 °C) is much larger
+    # because the established thermocline traps shortwave energy in the
+    # epilimnion, preventing it from mixing downward.
     surface_diurnal: float = 0.3 * np.sin(2 * np.pi * sequence / 86_400)
 
     profile: dict[str, float] = {}
@@ -247,7 +257,39 @@ def generate_reading(sequence: int) -> dict:
         "wind_speed_ms": round(wind_speed_ms, 3),
         "water_temp_profile": _water_temp_profile(sequence),
         "chlorophyll_ugl": round(chlorophyll_ugl, 3),
+        "node_id": NODE_ID,
     }
+
+
+# ---------------------------------------------------------------------------
+# Node registration
+# ---------------------------------------------------------------------------
+
+def register_node() -> bool:
+    """
+    Self-register this edge node with the Sentinel-Stream API on startup.
+
+    Registers node_id, position, and location label so the swarm dashboard
+    can display the full topology.  Returns True on success, False on failure
+    (non-fatal — the node continues streaming regardless).
+    """
+    try:
+        resp = requests.post(
+            REGISTER_ENDPOINT,
+            json={
+                "node_id":  NODE_ID,
+                "lat":      BUOY_LAT,
+                "long":     BUOY_LON,
+                "location": BUOY_LOCATION,
+            },
+            timeout=5.0,
+        )
+        resp.raise_for_status()
+        logger.info("Node '%s' registered with API at (%.4f, %.4f).", NODE_ID, BUOY_LAT, BUOY_LON)
+        return True
+    except Exception as exc:
+        logger.warning("Could not register node '%s': %s — continuing without registration.", NODE_ID, exc)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +366,8 @@ def run_emulator() -> None:
     """
     logger.info(
         "Sentinel-Stream Mendota Emulator starting — "
-        "buoy position: %.4f° N, %.4f° W",
+        "node=%s  position: %.4f° N, %.4f° W",
+        NODE_ID,
         BUOY_LAT,
         abs(BUOY_LON),
     )
@@ -336,6 +379,8 @@ def run_emulator() -> None:
         EMIT_INTERVAL_S,
         INGEST_ENDPOINT,
     )
+
+    register_node()
 
     sequence: int = 0
 
